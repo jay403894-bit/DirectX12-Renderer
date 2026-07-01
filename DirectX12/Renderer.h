@@ -14,7 +14,7 @@
 #include "TaskScheduler.h"
 #include "Mesh.h"
 #include "Vertex.h"
-
+#include "Font.h"
 #define MAX_BUCKETS_PER_LAYER 512
 #define NUM_LAYERS 4
 
@@ -129,13 +129,25 @@ public:
         }
     };
     void Submit(const Mesh& mesh, TextureResource* tex, DirectX::XMFLOAT2 offset, float width, float height, int zLayer=0, DirectX::XMFLOAT4 color = {1.0f,1.0f,1.0f,1.0f}, float rotation = 0.0f, DirectX::XMFLOAT2 uvOffset = {0.0f,0.0f}, DirectX::XMFLOAT2 uvScale = {1.0f,1.0f}, bool useAlphaFromRGB = false, uint32_t effectID = 0, DirectX::XMFLOAT4 effectParams = {0.0f,0.0f,0.0f,0.0f});
+    template<typename... Args>
+    void SubmitText(Font& font, float x, float y, const std::string& fmt, 
+        float scale = 1.0f,
+        DirectX::XMFLOAT4 color = { 1.0f,1.0f,1.0f,1.0f },
+        float rotation = 0.0f,
+        TextAlign align = TextAlign::Left,
+        int zLayer = 2,
+        Args&&... args)
+    {
+        std::string text = std::vformat(fmt, std::make_format_args(args...));
+        font.SubmitText(*this, text, x, y, scale, color, rotation, align, zLayer);
+    }
+    inline Font* GetSysFont() { return &font; }
     // Compiles a VS/PS pair + blend state into a new PSO and returns its effectID (index into
     // m_Effects). effectID 0 is the default sprite/text shader, registered by Initialize().
     // Call AFTER Initialize() (needs m_Device + m_RootSignature). Shares the existing root
     // signature -- only add an override param for a new one if an effect needs different
     // bound resources (most effects just need a different VS/PS/blend, not a new root sig).
     uint32_t RegisterEffect(const std::wstring& vsPath, const std::wstring& psPath, D3D12_BLEND_DESC blend);
-    void SubmitText(const char* text, float x, float y);
     //void Submit(DirectX::XMFLOAT2 offset, float width, float height, DirectX::XMFLOAT4 color, float rotation);
     static void FlushBatchTask(void* data) {
         FlushTaskContext* ctx = static_cast<FlushTaskContext*>(data);
@@ -225,6 +237,8 @@ public:
     void SetVSync(bool v) { m_VSync = v; }
     bool VSync() const { return m_VSync; }
     bool IsInitialized() const { return m_IsInitialized; }
+    void   UpdateFPS();                 // accumulates frames, logs FPS once per second
+
     ID3D12GraphicsCommandList* GetCommandList() {
         if (m_CommandList == nullptr) {
             OutputDebugStringA("ERROR: m_CommandList is NULL! Check initialization order.\n");
@@ -308,7 +322,6 @@ private:
     void   EnableDebugLayer();
     void   LogDeviceRemoved();          // dumps DRED breadcrumbs + page fault on device-removed
     // _DEBUG only; MUST run before the device is created
-    void   UpdateFPS();                 // accumulates frames, logs FPS once per second
     void CreateConstantBuffers();
     // ---- synchronization helpers (operate on m_CommandQueue / m_Fence / m_FenceEvent) ----
     uint64_t Signal();
@@ -319,6 +332,7 @@ private:
     static const uint8_t m_NumFrames = 3;
 	FlushTaskContextPool m_FlushTaskContextPool;
 	std::unique_ptr<ResourceManager> m_ResourceManager;
+    Font font;
 
     // Core devices
     Microsoft::WRL::ComPtr<ID3D12Device2>      m_Device;
@@ -387,6 +401,11 @@ private:
     uint64_t m_frameCounter = 0;
     double   m_elapsedSeconds = 0.0;
     std::chrono::high_resolution_clock::time_point m_t0;
+    // Last COMPUTED fps value -- updated once/sec inside UpdateFPS()'s averaging window, but
+    // the text must be SUBMITTED every frame (this renderer has no persistent draw state --
+    // skip a frame's Submit() and it just doesn't draw that frame) or it flickers, visible for
+    // one frame per second instead of staying on screen continuously.
+    double m_LastFPS = 0.0;
 
     // Delta time, independent of the FPS-averaging clock above -- see GetFrameTime().
     std::chrono::high_resolution_clock::time_point m_LastFrameTime;

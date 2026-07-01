@@ -90,6 +90,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	while (window.ProcessMessages())
 	{
 		float dt = renderer.GetFrameTime();
+		renderer.UpdateFPS();
 		renderer.UpdateGlobalUniforms(renderer.GetScreenSize());
 		renderer.BeginFrame(clearColor);
 		// Now you are the "Director" - you decide what to draw!

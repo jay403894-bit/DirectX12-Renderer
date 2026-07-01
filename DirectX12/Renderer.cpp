@@ -111,6 +111,13 @@ void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWa
 	m_CommandQueue->ExecuteCommandLists(1, uploadLists);
 	Flush();                              // GPU finished the copy...
 	m_ResourceManager->ReleaseUploadBuffers(); // ...so the staging buffers are safe to free
+
+	// Renderer's own built-in Font (used by UpdateFPS()'s SubmitText convenience wrapper).
+	// MUST come after everything above: Font::Load() needs m_ResourceManager (texture load)
+	// and calls ExecuteUploadCommand(), which does m_CommandList->Reset(...) -- both are only
+	// valid from this point on. Loading it any earlier derefs a null m_CommandList/m_ResourceManager.
+	font.Load(ExeRelative(L"font.fnt"), ExeRelative(L"font.png"), *this);
+
 	m_IsInitialized = true;
 }
 
@@ -847,6 +854,7 @@ void Renderer::Submit(
 	}
 }
 
+
 void Renderer::UpdateFPS()
 {
 	using clock = std::chrono::high_resolution_clock;
@@ -856,13 +864,15 @@ void Renderer::UpdateFPS()
 	m_t0 = t1;
 	if (m_elapsedSeconds > 1.0)
 	{
-		wchar_t buffer[64];
-		double fps = m_frameCounter / m_elapsedSeconds;
-		swprintf_s(buffer, L"FPS: %f\n", fps);
-		OutputDebugStringW(buffer);
+		// Recompute the DISPLAYED value only once/sec (a proper averaging window) -- but
+		// SubmitText() below still runs every call, using this cached value, so the text
+		// itself is submitted (and therefore drawn) every frame, not just the one frame/sec
+		// this branch happens to fire on.
+		m_LastFPS = m_frameCounter / m_elapsedSeconds;
 		m_frameCounter = 0;
 		m_elapsedSeconds = 0.0;
 	}
+	SubmitText(font, 10, 10, "FPS: {:.1f}", 1.0f, { 57.0f / 255.0f, 255.0f / 255.0f, 20.0f / 255.0f, 1.0f }, 0.0f, TextAlign::Right, 2, m_LastFPS);
 }
 void Renderer::UpdateGlobalUniforms(DirectX::XMFLOAT2 screenSize) {
 	float ar = screenSize.x / (screenSize.y > 0.0f ? screenSize.y : 1.0f);
