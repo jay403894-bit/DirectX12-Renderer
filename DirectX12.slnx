@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="DirectX12/DirectX12.vcxproj" Id="6ef8b916-dba1-42d9-ad6b-726405bd30ce" />
+</Solution>
