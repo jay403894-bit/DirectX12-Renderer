@@ -1,6 +1,6 @@
-#include "Font.h"
-#include "Renderer.h"
-#include "Helpers.h"
+#include "../include/Font.h"
+#include "../include/Renderer.h"
+#include "../include/Helpers.h"
 #include <fstream>
 #include <sstream>
 #include <cstdio>

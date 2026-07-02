@@ -4,11 +4,11 @@
 #include <cstdint>
 #include <cwchar>       // wcscmp, wcstol
 
-#include "Window.h"
-#include "Renderer.h"
-#include "Helpers.h"
-#include "Font.h"
-#include "TaskDAG.h"
+#include "../include/Window.h"
+#include "../include/Renderer.h"
+#include "../include/Helpers.h"
+#include "../include/Font.h"
+#include "../include/TaskDAG.h"
 // -w/--width, -h/--height, -warp/--warp. Parsed here (an app concern), then handed
 // to the Window (size) and Renderer (warp adapter).
 static void ParseCommandLine(uint32_t& width, uint32_t& height, bool& useWarp)

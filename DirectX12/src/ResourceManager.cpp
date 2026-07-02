@@ -1,5 +1,5 @@
-#include "ResourceManager.h"
-#include "Helpers.h"
+#include "../include/ResourceManager.h"
+#include "../include/Helpers.h"
 
 ResourceManager::ResourceManager(ID3D12Device* device, ID3D12DescriptorHeap* sharedSrvHeap)
     : m_Device(device), m_SrvHeap(sharedSrvHeap) {}

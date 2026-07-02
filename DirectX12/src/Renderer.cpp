@@ -1,6 +1,6 @@
-#include "Renderer.h"
-#include "Helpers.h"      // ThrowIfFailed
-#include "Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
+#include "../include/Renderer.h"
+#include "../include/Helpers.h"      // ThrowIfFailed
+#include "../include/Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
 #include <T_Thread.h>     // T_Thread::GetCurrent()->qIndex for worker-local storage
 #include <algorithm>      // std::max
 #include <cassert>
