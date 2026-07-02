@@ -22,24 +22,31 @@ ResourceManager* Renderer::GetResourceManager() const { return m_ResourceManager
 // able to parse and memorize.
 void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWarp)
 {
+	DagCheckpoint("Initialize: begin");
 	m_ClientWidth = width;
 	m_ClientHeight = height;
 	m_UseWarp = useWarp;
 	EnableDebugLayer();                 // must precede ANY device work
 	m_TearingSupported = CheckTearingSupport();
+	DagCheckpoint("Initialize: after EnableDebugLayer/CheckTearingSupport");
 
 	m_t0 = std::chrono::high_resolution_clock::now();
 	ComPtr<IDXGIAdapter4> adapter = GetAdapter(m_UseWarp);   // 1. pick a GPU
 	m_Device = CreateDevice(adapter);                 // 2. the device
+	DagCheckpoint("Initialize: device created");
 	m_RootSignature = CreateRootSignature(); // Defines the "interface" for your shader
+	DagCheckpoint("Initialize: root signature created");
 	// effectID 0: the default sprite/text shader. Registered here so Submit()'s default
 	// effectID=0 and FlushBatchTask's m_Effects[b.effectID] lookup both resolve correctly.
 	m_PipelineState = CreatePipelineState(L"VertexShader.cso", L"PixelShader.cso", DefaultAlphaBlend());
+	DagCheckpoint("Initialize: pipeline state created");
 	m_Effects.push_back({ m_PipelineState });
 	CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
 	CreateInstanceBuffer(m_Device.Get(), 65536);  // 64K instances max per frame
+	DagCheckpoint("Initialize: instance buffer created");
 	// Allocate per-worker submission buffers (heap-allocated to avoid stack overflow)
 	m_WorkerLocalStorage = std::make_unique<std::array<WorkerLocalSubmissionData, MAX_WORKERS>>();
+	DagCheckpoint("Initialize: worker local storage allocated");
 
 	// 2. Create the Resource Desc as an lvalue
 	CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(indices));
@@ -52,9 +59,13 @@ void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWa
 	const int taskCount = m_FlushTaskContextPool.taskCount;
 	m_CommandContextPool.resize((size_t)taskCount * NUM_LAYERS);
 	m_LayerProvisioned.assign(NUM_LAYERS, false);
+	DagCheckpoint("Initialize: command context pool sized");
 	CreateConstantBuffers(); // Creates a buffer for each frame (CPU->GPU)
+	DagCheckpoint("Initialize: constant buffers created");
 	m_CommandQueue = CreateCommandQueue(D3D12_COMMAND_LIST_TYPE_DIRECT); // 3. submission queue
+	DagCheckpoint("Initialize: command queue created");
 	m_SwapChain = CreateSwapChain(hWnd, m_ClientWidth, m_ClientHeight, m_NumFrames); // 4. back buffers
+	DagCheckpoint("Initialize: swap chain created");
 
 	// 3. Pass those variables instead of the temporary function calls
 	m_Device->CreateCommittedResource(
@@ -70,26 +81,32 @@ void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWa
 	ibv.SizeInBytes = sizeof(indices);
 	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex();
 	m_FrameResourceIndex = 0; // app-controlled sync-slot counter, independent of the swap chain
+	DagCheckpoint("Initialize: index buffer created");
 
 	m_RTVDescriptorHeap = CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, m_NumFrames); // 5. RTV heap
 	m_RTVDescriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	UpdateRenderTargetViews();                               // 6. an RTV per back buffer
+	DagCheckpoint("Initialize: RTVs created");
 
 	// ADD THIS:
 	m_SrvHeap = CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 256); // 256 is an example size
 	m_ResourceManager = std::make_unique<ResourceManager>(m_Device.Get(), m_SrvHeap.Get());
+	DagCheckpoint("Initialize: SRV heap + ResourceManager created");
 
 	for (int i = 0; i < m_NumFrames; ++i)                    // 7. one allocator per frame
 		m_CommandAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Initialize: per-frame command allocators created");
 
 	m_CommandList = CreateCommandList(                       // 8. the command list (PRE)
 		m_CommandAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Initialize: PRE command list created");
 
 	// POST list (RENDER_TARGET->PRESENT barrier), one allocator per frame.
 	for (int i = 0; i < m_NumFrames; ++i)
 		m_PostAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
 	m_PostList = CreateCommandList(
 		m_PostAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Initialize: POST command list created");
 
 	// Debug names for DRED breadcrumbs.
 	m_CommandQueue->SetName(L"MainQueue");
@@ -98,6 +115,7 @@ void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWa
 
 	m_Fence = CreateFence();                            // 9. CPU/GPU sync
 	m_FenceEvent = CreateEventHandle();
+	DagCheckpoint("Initialize: fence created");
 
 	// --- Texture upload ---
 	// LoadTexture RECORDS a copy into m_CommandList, so the list must exist (it was just
@@ -109,14 +127,18 @@ void Renderer::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWa
 	ThrowIfFailed(m_CommandList->Close());
 	ID3D12CommandList* uploadLists[] = { m_CommandList.Get() };
 	m_CommandQueue->ExecuteCommandLists(1, uploadLists);
+	DagCheckpoint("Initialize: pre-upload list submitted, about to Flush()");
 	Flush();                              // GPU finished the copy...
+	DagCheckpoint("Initialize: Flush() returned");
 	m_ResourceManager->ReleaseUploadBuffers(); // ...so the staging buffers are safe to free
 
 	// Renderer's own built-in Font (used by UpdateFPS()'s SubmitText convenience wrapper).
 	// MUST come after everything above: Font::Load() needs m_ResourceManager (texture load)
 	// and calls ExecuteUploadCommand(), which does m_CommandList->Reset(...) -- both are only
 	// valid from this point on. Loading it any earlier derefs a null m_CommandList/m_ResourceManager.
+	DagCheckpoint("Initialize: about to font.Load()");
 	font.Load(ExeRelative(L"font.fnt"), ExeRelative(L"font.png"), *this);
+	DagCheckpoint("Initialize: font.Load() returned");
 
 	m_IsInitialized = true;
 }

@@ -17,12 +17,14 @@ static float FindField(const std::string& line, const char* key) {
 }
 
 void Font::Load(const std::wstring& fntPath, const std::wstring& atlasPath, Renderer& renderer) {
+    Renderer::DagCheckpoint("Font::Load: begin, about to open .fnt");
     // .fnt is plain text (AngelCode BMFont text format) -- read and parse line by line.
     std::ifstream file(fntPath);
     if (!file) {
         std::string p(fntPath.begin(), fntPath.end());
         throw std::runtime_error("Font::Load: cannot open '" + p + "'");
     }
+    Renderer::DagCheckpoint("Font::Load: .fnt opened, parsing");
 
     std::string line;
     while (std::getline(file, line)) {
@@ -50,12 +52,14 @@ void Font::Load(const std::wstring& fntPath, const std::wstring& atlasPath, Rend
     }
     if (scaleW <= 0.0f) scaleW = 1.0f;
     if (scaleH <= 0.0f) scaleH = 1.0f;
+    Renderer::DagCheckpoint("Font::Load: .fnt parsed, about to load atlas texture");
 
     // Atlas texture -- same LoadTexture + ExecuteUploadCommand idiom used for wall.png/wood.png.
     ResourceManager* rm = renderer.GetResourceManager();
     renderer.ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
         texture = rm->LoadTexture(atlasPath, cmd);
         });
+    Renderer::DagCheckpoint("Font::Load: atlas texture loaded, about to CreateMesh");
 
     // ONE unit quad (-0.5..0.5, UV 0..1), shared by every glyph. Per-instance uvOffset/uvScale
     // (set in DrawText) selects which part of the atlas each instance actually samples --
@@ -68,6 +72,7 @@ void Font::Load(const std::wstring& fntPath, const std::wstring& atlasPath, Rend
     };
     uint32_t quadIndices[] = { 0, 1, 2, 1, 3, 2 };
     unitQuad = rm->CreateMesh(quadVerts, 4, quadIndices, 6);
+    Renderer::DagCheckpoint("Font::Load: CreateMesh returned, Font::Load complete");
 }
 
 float Font::Kerning(int first, int second) const {

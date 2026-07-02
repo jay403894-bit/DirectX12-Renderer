@@ -128,6 +128,54 @@ public:
             nextIndex.store(0, std::memory_order_relaxed);
         }
     };
+    // ---- DAG task wrappers for BeginFrame/PresentFrame -----------------------------------
+    // Both context instances are SINGLE, reused every frame -- safe ONLY because frames stay
+    // serialized (frame N+1's StartFrame node is never built/fired until frame N's tail node
+    // has completed, so the previous frame's context has definitely already been read by the
+    // time this frame overwrites it). If frames are ever allowed to overlap, this MUST become
+    // a real per-in-flight-frame pool (same shape as FlushTaskContextPool) -- reusing a single
+    // instance across genuinely concurrent frames would be a data race on the context fields.
+    struct StartFrameContext {
+        Renderer* renderer;
+        float clearColor[4];
+    };
+    static void DagCheckpoint(const char* msg) {
+        FILE* f = nullptr; fopen_s(&f, "C:\\temp\\dag_checkpoint.log", "w");
+        if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+    }
+    static void StartFrameTask(void* data) {
+        auto* ctx = static_cast<StartFrameContext*>(data);
+        DagCheckpoint("StartFrameTask: begin (about to call BeginFrame)");
+        // TEMP DIAGNOSTIC: Task::Execute() is noexcept, so any exception thrown in here
+        // (e.g. ThrowIfFailed) would otherwise hit std::terminate() before its message ever
+        // surfaces -- catch + log to a file so the real error is visible, then remove this.
+        try { ctx->renderer->BeginFrame(ctx->clearColor); }
+        catch (const std::exception& e) {
+            FILE* f = nullptr; fopen_s(&f, "C:\\temp\\dag_crash.log", "a");
+            if (f) { fprintf(f, "StartFrameTask threw: %s\n", e.what()); fclose(f); }
+            throw;
+        }
+        DagCheckpoint("StartFrameTask: end");
+    }
+    struct PresentFrameContext {
+        Renderer* renderer;
+    };
+    static void PresentFrameTask(void* data) {
+        auto* ctx = static_cast<PresentFrameContext*>(data);
+        DagCheckpoint("PresentFrameTask: begin (about to call PresentFrame)");
+        try { ctx->renderer->PresentFrame(); }
+        catch (const std::exception& e) {
+            FILE* f = nullptr; fopen_s(&f, "C:\\temp\\dag_crash.log", "a");
+            if (f) { fprintf(f, "PresentFrameTask threw: %s\n", e.what()); fclose(f); }
+            throw;
+        }
+        DagCheckpoint("PresentFrameTask: end");
+        // PresentFrame's own logic is UNCHANGED
+    }
+    StartFrameContext m_StartFrameCtx{};
+    PresentFrameContext m_PresentFrameCtx{};
+    // ----------------------------------------------------------------------------------------
+
     void Submit(const Mesh& mesh, TextureResource* tex, DirectX::XMFLOAT2 offset, float width, float height, int zLayer=0, DirectX::XMFLOAT4 color = {1.0f,1.0f,1.0f,1.0f}, float rotation = 0.0f, DirectX::XMFLOAT2 uvOffset = {0.0f,0.0f}, DirectX::XMFLOAT2 uvScale = {1.0f,1.0f}, bool useAlphaFromRGB = false, uint32_t effectID = 0, DirectX::XMFLOAT4 effectParams = {0.0f,0.0f,0.0f,0.0f});
     template<typename... Args>
     void SubmitText(Font& font, float x, float y, const std::string& fmt, 
