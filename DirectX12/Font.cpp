@@ -97,10 +97,12 @@ void Font::SubmitText(Renderer& renderer, const std::string& text, float x, floa
             startX = x - lineWidth * 0.5f;
         }
         else if (align == TextAlign::Left) {           // ← changed
-            startX = x - lineWidth;                    // ← was Right, now Left
+            startX = x;                                // ← was Left, now Right
+
         }
         else if (align == TextAlign::Right) {          // ← changed
-            startX = x;                                // ← was Left, now Right
+            startX = x - lineWidth;                    // ← was Right, now Left
+
         }
 
         SubmitLine(renderer, line, startX, currentY, scale, color, rotation, zLayer);

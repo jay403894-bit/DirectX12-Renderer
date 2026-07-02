@@ -60,7 +60,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	bool useWarp = false;
 	ParseCommandLine(width, height, useWarp);
 
-	Window   window(hInstance, L"Learning DirectX 12", width, height);
+	Window   window(hInstance, L"DirectX 12", width, height);
 	Renderer renderer;
 	window.SetRenderer(&renderer);                       // so WM_SIZE reaches the renderer
 	EarlyCheckpoint("Window/Renderer constructed, about to Initialize()");
@@ -151,9 +151,9 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		auto* textTask = scheduler.CreateTask([&renderer, &checkpoint] {
 			checkpoint("textTask: begin");
 			Font* f = renderer.GetSysFont();
-			renderer.SubmitText(*f,  400.0f, 150.0f, "Left Aligned", 1.0f, {1,1,1,1}, 0.0f, TextAlign::Left, 0);
+			renderer.SubmitText(*f,  400.0f, 150.0f, "Left Aligned\ntest", 1.0f, {1,1,1,1}, 0.0f, TextAlign::Left, 0);
 			renderer.SubmitText(*f,  400.0f, 250.0f, "Center Aligned", 1.0f, {1,1,1,1}, 0.0f, TextAlign::Center, 0);
-			renderer.SubmitText(*f,  400.0f, 350.0f, "Right Aligned", 1.0f, {1,1,1,1}, 0.0f, TextAlign::Right, 0);
+			renderer.SubmitText(*f,  400.0f, 350.0f, "Right Aligned\ntest", 1.0f, {1,1,1,1}, 0.0f, TextAlign::Right, 0);
 			checkpoint("textTask: UpdateFPS");
 			renderer.UpdateFPS(); // its own SubmitText call -- same tier, same rules
 			checkpoint("textTask: end");
