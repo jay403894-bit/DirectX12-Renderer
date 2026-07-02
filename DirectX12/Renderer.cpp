@@ -894,7 +894,7 @@ void Renderer::UpdateFPS()
 		m_frameCounter = 0;
 		m_elapsedSeconds = 0.0;
 	}
-	SubmitText(font, 10, 10, "FPS: {:.1f}", 1.0f, { 57.0f / 255.0f, 255.0f / 255.0f, 20.0f / 255.0f, 1.0f }, 0.0f, TextAlign::Right, 2, m_LastFPS);
+	SubmitText(font, 10, 10, "FPS: {:.1f}", 1.0f, { 57.0f / 255.0f, 255.0f / 255.0f, 20.0f / 255.0f, 1.0f }, 0.0f, TextAlign::Left, 2, m_LastFPS);
 }
 void Renderer::UpdateGlobalUniforms(DirectX::XMFLOAT2 screenSize) {
 	float ar = screenSize.x / (screenSize.y > 0.0f ? screenSize.y : 1.0f);
