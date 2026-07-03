@@ -126,12 +126,9 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		FILE* f = nullptr; fopen_s(&f, "C:\\temp\\dag_checkpoint.log", "w");
 		if (f) { fprintf(f, "%s\n", msg); fclose(f); }
 	};
-	uint64_t frameNum = 0;
 
 	while (window.ProcessMessages())
 	{
-		char buf[64]; sprintf_s(buf, "frame %llu: top of loop", (unsigned long long)frameNum);
-		checkpoint(buf);
 
 		float dt = renderer.GetFrameTime();
 		renderer.UpdateGlobalUniforms(renderer.GetScreenSize());
@@ -211,7 +208,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		checkpoint("dag.Submit() returned, entering WaitForMain");
 		scheduler.WaitForMain(frameWg); // pumps ProcessMainThread; frame N+1 can't start until this returns
 		checkpoint("WaitForMain returned");
-		++frameNum;
+
 	}                               // continuous render loop
 
 	core.Cleanup();                                       // flush the GPU, close the fence event
