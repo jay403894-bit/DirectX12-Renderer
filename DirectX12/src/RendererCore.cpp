@@ -1,5 +1,5 @@
 #include "../include/RendererCore.h"
-#include "../include/Renderer.h"     // Renderer2D -- PresentFrame collects its draw lists
+#include "../include/Renderer2D.h"     // Renderer2D -- PresentFrame collects its draw lists
 #include "../include/Helpers.h"      // ThrowIfFailed
 #include "../include/Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
 #include <T_Thread.h>
@@ -146,17 +146,20 @@ void RendererCore::PresentFrame() {
 	m_PostList->ResourceBarrier(1, &toPresent);
 	m_PostList->Close();
 
-	// Execute PRE + particle list + all 2D worker lists (LAYER-MAJOR, see Renderer2D::
-	// CollectCommandLists) + POST. This is the seam a future Renderer3D would plug into: another
-	// CollectCommandLists()-style call between the particle list and POST.
+	// Execute PRE + all physics dispatches + [particle draws / 2D layers interleaved by
+	// zLayer] + POST. Physics dispatches never touch the render target, so they always run as
+	// one block right after PRE, before ANY draw. From there, particle pools and Renderer2D's
+	// sprite/text layers are submitted together in ascending zLayer order -- particles before
+	// sprites within the same layer -- so a pool registered at zLayer 2 actually draws over
+	// whatever's at zLayer 0/1 and under zLayer 3, instead of always sitting under everything.
 	std::vector<ID3D12CommandList*> allLists;
 	allLists.push_back(m_CommandList.Get());  // PRE: clear + PRESENT->RENDER_TARGET
-	// Particle compute dispatch + point-list draw (see UpdateParticles/UpdateParticlesTask) --
-	// recorded by the particlesNode DAG task, closed but not yet submitted. Must run after PRE
-	// (needs the cleared, RENDER_TARGET-state back buffer) and before the sprite/text worker
-	// lists (so particles land underneath them, not on top).
-	allLists.push_back(m_ComputeList.Get());
-	if (m_Renderer2D) m_Renderer2D->CollectCommandLists(frame, allLists);
+	allLists.push_back(m_ComputeList.Get());  // every pool's physics/spawn dispatch (see UpdateParticles)
+	for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+		for (auto& pool : m_ParticleEffects)
+			if (pool.zLayer == layer) allLists.push_back(pool.drawList.Get());
+		if (m_Renderer2D) m_Renderer2D->CollectCommandListsForLayer(layer, frame, allLists);
+	}
 	allLists.push_back(m_PostList.Get());     // POST: RENDER_TARGET->PRESENT
 	m_CommandQueue->ExecuteCommandLists((UINT)allLists.size(), allLists.data());
 
@@ -616,9 +619,10 @@ void RendererCore::InitializeParticleSystem() {
 	m_ParticlePSO = CreateParticlePipelineState(L"ParticleVS.cso", L"ParticlePS.cso"); // shared draw shader for now
 }
 
-uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles) {
+uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, int zLayer) {
 	ParticleEffectPool pool;
 	pool.maxParticles = maxParticles;
+	pool.zLayer = zLayer;
 
 	D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
@@ -668,6 +672,12 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 	));
 
 	pool.updatePSO = CreateComputePipelineState(updateCsPath);
+
+	// This pool's OWN draw allocator/list -- separate from m_ComputeList (compute-only) so its
+	// draw can be submitted independently, interleaved with Renderer2D's zLayers in PresentFrame.
+	for (int i = 0; i < NumFrames; ++i)
+		pool.drawAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	pool.drawList = CreateCommandList(pool.drawAllocators[0], D3D12_COMMAND_LIST_TYPE_DIRECT);
 
 	m_ParticleEffects.push_back(std::move(pool));
 	uint32_t effectID = (uint32_t)m_ParticleEffects.size() - 1;
@@ -764,7 +774,10 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateParticlePipeline
 	psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	psoDesc.DepthStencilState.DepthEnable = FALSE;
 	psoDesc.DepthStencilState.StencilEnable = FALSE;
-	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+	// TRIANGLE, not POINT -- ParticleVS.hlsl now generates a procedural quad (6 verts via
+	// SV_VertexID) per particle instead of a fixed-size point-list dot, which is what gives
+	// particles a controllable size at all (POINTLIST has no size/UV support in D3D12).
+	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	psoDesc.NumRenderTargets = 1;
 	psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 	psoDesc.SampleDesc.Count = 1;
@@ -786,7 +799,7 @@ void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsComm
 		p.lifetime = 5.0f;
 		p.age = 0.0f;
 		p.isActive = 0; // inactive until a spawn claims this slot
-		p.padding = 0;
+		p.size = 4.0f;
 		p.color = { 1,1,1,1 };
 	}
 
@@ -836,6 +849,10 @@ void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsComm
 	cmd->ResourceBarrier(1, &deadListToUAV);
 }
 
+// Compute-only: advances every pool's physics/spawn dispatch on the SHARED m_ComputeList. This
+// never touches a render target, so pool order here doesn't matter and it always runs as one
+// unit, before ANY particle or 2D draw -- only the DRAW half (RecordParticleDraw) needs to be
+// ordered relative to Renderer2D's zLayers, which is why it's split out onto each pool's own list.
 void RendererCore::UpdateParticles() {
 	const int frame = m_FrameResourceIndex;
 	const int backBuffer = m_CurrentBackBufferIndex;
@@ -880,25 +897,40 @@ void RendererCore::UpdateParticles() {
 		auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(pool.particleBuffer.Get(),
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		m_ComputeList->ResourceBarrier(1, &toSRV);
-
-		// --- Draw pass: one point per particle in THIS pool (SHARED draw PSO) ---
-		m_ComputeList->SetGraphicsRootSignature(m_ParticleRootSignature.Get());
-		m_ComputeList->SetPipelineState(m_ParticlePSO.Get());
-		m_ComputeList->SetGraphicsRootConstantBufferView(0, m_ConstantBuffers[frame]->GetGPUVirtualAddress());
-		m_ComputeList->SetGraphicsRootShaderResourceView(1, pool.particleBuffer->GetGPUVirtualAddress());
-
-		CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
-			m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
-		m_ComputeList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-		D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)m_ClientWidth, (float)m_ClientHeight, 0.0f, 1.0f };
-		D3D12_RECT scissor = { 0, 0, (LONG)m_ClientWidth, (LONG)m_ClientHeight };
-		m_ComputeList->RSSetViewports(1, &viewport);
-		m_ComputeList->RSSetScissorRects(1, &scissor);
-		m_ComputeList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
-		m_ComputeList->DrawInstanced(1, pool.maxParticles, 0, 0);
 	}
-
 	ThrowIfFailed(m_ComputeList->Close());
+
+	// Draw half: one small list PER POOL, recorded here but submitted by PresentFrame wherever
+	// this pool's zLayer falls relative to Renderer2D's layers.
+	for (auto& pool : m_ParticleEffects)
+		RecordParticleDraw(pool, frame, backBuffer);
+}
+
+// Binds straight to the back buffer -- no clear (PRE already did that) and no state transition
+// (PRE already moved it to RENDER_TARGET; POST moves it back to PRESENT later). Safe to record
+// AFTER the pool's compute dispatch above has closed m_ComputeList: the particleBuffer SRV
+// transition already happened there, so this list just reads it.
+void RendererCore::RecordParticleDraw(ParticleEffectPool& pool, int frame, int backBuffer) {
+	pool.drawAllocators[frame]->Reset();
+	pool.drawList->Reset(pool.drawAllocators[frame].Get(), m_ParticlePSO.Get());
+
+	pool.drawList->SetGraphicsRootSignature(m_ParticleRootSignature.Get());
+	pool.drawList->SetGraphicsRootConstantBufferView(0, m_ConstantBuffers[frame]->GetGPUVirtualAddress());
+	pool.drawList->SetGraphicsRootShaderResourceView(1, pool.particleBuffer->GetGPUVirtualAddress());
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
+		m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
+	pool.drawList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)m_ClientWidth, (float)m_ClientHeight, 0.0f, 1.0f };
+	D3D12_RECT scissor = { 0, 0, (LONG)m_ClientWidth, (LONG)m_ClientHeight };
+	pool.drawList->RSSetViewports(1, &viewport);
+	pool.drawList->RSSetScissorRects(1, &scissor);
+	// 6 verts/instance -- ParticleVS.hlsl generates a quad (2 triangles) per particle via
+	// SV_VertexID, not a single point (see CreateParticlePipelineState's topology comment).
+	pool.drawList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	pool.drawList->DrawInstanced(6, pool.maxParticles, 0, 0);
+
+	ThrowIfFailed(pool.drawList->Close());
 }
 
 void RendererCore::RequestSpawn(uint32_t effectID, Particle p) {
@@ -909,7 +941,7 @@ void RendererCore::RequestSpawn(uint32_t effectID, Particle p) {
 }
 
 void RendererCore::RequestSpawn(uint32_t effectID, DirectX::XMFLOAT2 basePosition, float offsetRadius,
-	DirectX::XMFLOAT2 velocity, float lifetime, DirectX::XMFLOAT4 color) {
+	DirectX::XMFLOAT2 velocity, float lifetime, DirectX::XMFLOAT4 color, float size) {
 	static std::mt19937 rng(std::random_device{}());
 	std::uniform_real_distribution<float> jitter(-offsetRadius, offsetRadius);
 
@@ -918,6 +950,7 @@ void RendererCore::RequestSpawn(uint32_t effectID, DirectX::XMFLOAT2 basePositio
 	p.velocity = velocity;
 	p.lifetime = lifetime;
 	p.color = color;
+	p.size = size;
 	RequestSpawn(effectID, p);
 }
 

@@ -5,7 +5,7 @@
 #include <cwchar>       // wcscmp, wcstol
 
 #include "../include/Window.h"
-#include "../include/Renderer.h"
+#include "../include/Renderer2D.h"
 #include "../include/Helpers.h"
 #include "../include/Font.h"
 #include "../include/TaskDAG.h"
@@ -78,8 +78,10 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	// m_CommandQueue), same pattern as RegisterEffect() for sprite shaders. Each gets its OWN
 	// compute shader -- see UpdateParticles.hlsl (straight-line motion) and WaveParticles.hlsl
 	// (sin-driven wave) -- and its own particle pool, so they can never step on each other's slots.
-	uint32_t linearEffect = core.RegisterParticleEffect(L"UpdateParticles.cso", 256000);
-	uint32_t waveEffect = core.RegisterParticleEffect(L"WaveParticles.cso", 50000);
+	// zLayer=1 here: draws over anything at zLayer 0 (e.g. background tiles) and under zLayer 2+
+	// (e.g. the FPS/text overlay) -- see RendererCore::PresentFrame's layer-interleaving comment.
+	uint32_t linearEffect = core.RegisterParticleEffect(L"UpdateParticles.cso", 256000, 1);
+	uint32_t waveEffect = core.RegisterParticleEffect(L"WaveParticles.cso", 50000, 1);
 	EarlyCheckpoint("particle effects registered");
 	window.Show();
 	Vertex vertices[] = {

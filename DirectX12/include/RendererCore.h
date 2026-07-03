@@ -22,7 +22,12 @@ struct Particle
     // long it's been alive. Nothing branches on it yet outside the update shaders themselves.
     float age;
     uint32_t isActive; // 1 if alive, 0 if dead
-    uint32_t padding;
+    // Quad side length in pixels -- ParticleVS.hlsl now draws a procedural billboarded quad
+    // (SV_VertexID-generated corners) sized by this instead of a fixed-size POINTLIST dot
+    // (D3D12 point-list topology has no size or texture-coordinate support at all, so it
+    // couldn't ever have supported this -- this field is what actually made size the property
+    // of a per-particle draw rather than a GPU/driver-fixed 1px dot).
+    float size;
     // Per-particle color -- ParticleVS.hlsl reads this instead of a hardcoded color, so each
     // RequestSpawn() call can look different.
     DirectX::XMFLOAT4 color;
@@ -168,6 +173,12 @@ public:
     // slot and rasterizing a point don't need to differ per behavior.
     struct ParticleEffectPool {
         uint32_t maxParticles = 0;
+        // Which sprite/text zLayer (see Renderer2D's NUM_LAYERS system) this pool's DRAW
+        // interleaves with -- PresentFrame submits particle pools and 2D layers together in
+        // ascending zLayer order, particles-before-sprites within the same layer. The physics/
+        // spawn COMPUTE dispatch is unaffected by this (it never touches the render target, so
+        // it always just runs once for every pool, before any draw).
+        int zLayer = 0;
         Microsoft::WRL::ComPtr<ID3D12Resource> particleBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> deadListBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> spawnBuffer;
@@ -177,20 +188,26 @@ public:
         // Kept alive only until RegisterParticleEffect's seeding Flush().
         Microsoft::WRL::ComPtr<ID3D12Resource> particleUploadBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> deadListUploadBuffer;
+        // This pool's OWN draw list -- separate from m_ComputeList (which only ever holds the
+        // physics/spawn DISPATCHES, never a draw) so a pool's draw can be submitted at whatever
+        // point in zLayer order PresentFrame decides, independent of every other pool's.
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> drawAllocators[NumFrames];
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> drawList;
     };
     // Compiles updateCsPath into a new pool's update PSO, allocates its particle/dead-list/spawn
     // buffers sized for maxParticles, and seeds it (every particle inactive, dead list full).
     // Call AFTER Initialize() (needs m_ComputeRootSignature/m_CommandQueue). Returns the effectID
     // to pass to RequestSpawn.
-    uint32_t RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles);
+    uint32_t RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, int zLayer = 0);
     // effectID comes from RegisterParticleEffect() -- routes the spawn to that pool's own
     // spawn buffer/dead list, so different behaviors never share particle slots.
     void RequestSpawn(uint32_t effectID, Particle p);
     // Convenience overload: jitters position by up to +/-offsetRadius on each axis (uniform
     // random) so multiple spawns from the same call site scatter instead of stacking into a
     // line/point. Pass offsetRadius=0 for an exact position.
+    // size: quad side length in pixels (see Particle::size) -- defaults to a reasonable small dot.
     void RequestSpawn(uint32_t effectID, DirectX::XMFLOAT2 basePosition, float offsetRadius,
-        DirectX::XMFLOAT2 velocity, float lifetime, DirectX::XMFLOAT4 color);
+        DirectX::XMFLOAT2 velocity, float lifetime, DirectX::XMFLOAT4 color, float size = 4.0f);
     void UpdateParticles();
 
 private:
@@ -235,6 +252,10 @@ private:
     void SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsCommandList* cmd);
     void FlushSpawns(ParticleEffectPool& pool);
     void InitializeParticleSystem();
+    // Records ONLY this pool's draw (bind RTV/viewport/PSO/SRV, DrawInstanced) onto its own
+    // drawList -- split out from the physics/spawn dispatch so PresentFrame can interleave each
+    // pool's draw with Renderer2D's zLayers independently of the others.
+    void RecordParticleDraw(ParticleEffectPool& pool, int frame, int backBuffer);
 
     std::vector<ParticleEffectPool> m_ParticleEffects;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_ComputeRootSignature; // shared by every pool's updatePSO + m_SpawnPSO

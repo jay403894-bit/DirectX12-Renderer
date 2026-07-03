@@ -11,8 +11,8 @@ struct Particle
     // per phase.
     float age;
     uint isActive; // 1 if alive, 0 if dead
-    uint padding;
-    float4 color; // must stay in sync with ParticleVS.hlsl/Renderer.h's Particle
+    float size;    // quad side length in pixels -- see ParticleVS.hlsl
+    float4 color; // must stay in sync with ParticleVS.hlsl/RendererCore.h's Particle
 };
 
 // u0: this pool's own particle buffer. u1: this pool's own dead-list free list + hidden UAV
