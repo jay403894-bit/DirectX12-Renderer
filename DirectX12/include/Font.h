@@ -6,7 +6,7 @@
 #include "Mesh.h"
 #include "ResourceManager.h"
 
-class Renderer;
+class Renderer2D;
 
 struct Glyph {
     float x = 0, y = 0, width = 0, height = 0;
@@ -21,10 +21,10 @@ enum class TextAlign {
 
 class Font {
 public:
-    void Load(const std::wstring& fntPath, const std::wstring& atlasPath, Renderer& renderer);
+    void Load(const std::wstring& fntPath, const std::wstring& atlasPath, Renderer2D& renderer);
 
     // Main draw function - now with alignment and line support
-    void SubmitText(Renderer& renderer, const std::string& text, float x, float y, float scale = 1.0f,
+    void SubmitText(Renderer2D& renderer, const std::string& text, float x, float y, float scale = 1.0f,
         DirectX::XMFLOAT4 color = { 1,1,1,1 }, float rotation = 0.0f,
         TextAlign align = TextAlign::Left, int zLayer = 2);
 
@@ -32,7 +32,7 @@ public:
     float LineHeight() const { return lineHeight; }
 
 private:
-    void SubmitLine(Renderer& renderer, const std::string& line, float x, float y, float scale,
+    void SubmitLine(Renderer2D& renderer, const std::string& line, float x, float y, float scale,
         DirectX::XMFLOAT4 color, float rotation, int zLayer);
 
     float Kerning(int first, int second) const;

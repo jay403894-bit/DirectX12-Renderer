@@ -61,12 +61,26 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	ParseCommandLine(width, height, useWarp);
 
 	Window   window(hInstance, L"DirectX 12", width, height);
-	Renderer renderer;
-	window.SetRenderer(&renderer);                       // so WM_SIZE reaches the renderer
+	// RendererCore: device/swap chain/fences/PRE-POST lists/particle system -- the low-level
+	// GPU guts, reusable by a future 3D renderer. Renderer2D: sprite/text batching, driven BY
+	// core's BeginFrame/PresentFrame via SetRenderer2D(). See both classes' header comments.
+	RendererCore core;
+	Renderer2D   renderer;
+	core.SetRenderer2D(&renderer);
+	window.SetRenderer(&core);                           // so WM_SIZE reaches Core (owns Resize/VSync)
 	EarlyCheckpoint("Window/Renderer constructed, about to Initialize()");
 
-	renderer.Initialize(window.GetHandle(), width, height, useWarp);
-	EarlyCheckpoint("renderer.Initialize() returned");
+	core.Initialize(window.GetHandle(), width, height, useWarp);
+	EarlyCheckpoint("core.Initialize() returned");
+	renderer.Initialize(core); // builds root sig/PSO/instance buffer/SRV heap/font against core's device
+	EarlyCheckpoint("renderer.Initialize(core) returned");
+	// Register particle effects AFTER both Initialize() calls (needs core's m_ComputeRootSignature/
+	// m_CommandQueue), same pattern as RegisterEffect() for sprite shaders. Each gets its OWN
+	// compute shader -- see UpdateParticles.hlsl (straight-line motion) and WaveParticles.hlsl
+	// (sin-driven wave) -- and its own particle pool, so they can never step on each other's slots.
+	uint32_t linearEffect = core.RegisterParticleEffect(L"UpdateParticles.cso", 256000);
+	uint32_t waveEffect = core.RegisterParticleEffect(L"WaveParticles.cso", 50000);
+	EarlyCheckpoint("particle effects registered");
 	window.Show();
 	Vertex vertices[] = {
 		// New X, Y      Color (RGBA)          Tex (U, V)
@@ -128,19 +142,26 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		T_Threads::TaskDAG dag(scheduler);
 		checkpoint("dag constructed");
 
-		renderer.m_StartFrameCtx = { &renderer, { clearColor[0], clearColor[1], clearColor[2], clearColor[3] } };
-		auto* startTask = scheduler.CreateTask(Renderer::StartFrameTask, &renderer.m_StartFrameCtx);
+		core.m_StartFrameCtx = { &core, { clearColor[0], clearColor[1], clearColor[2], clearColor[3] } };
+		auto* startTask = scheduler.CreateTask(RendererCore::StartFrameTask, &core.m_StartFrameCtx);
 		checkpoint("startTask created");
 		auto* startNode = dag.CreateMainNode(startTask);
 		checkpoint("startNode created");
 
-		auto* spritesTask = scheduler.CreateTask([&renderer, &myOtherObject, &myTriangle, wood, wall, rotation, &checkpoint] {
+		auto* spritesTask = scheduler.CreateTask([&renderer, &myOtherObject, &myTriangle, wood, wall, rotation, &checkpoint, linearEffect, waveEffect] {
 			checkpoint("spritesTask: begin");
 			renderer.Submit(myOtherObject, wood, { 1280 / 2,720 / 2 }, 100, 100, 1, { 1.0f,1.0f,1.0f,1.0f }, rotation);
 			renderer.Submit(myTriangle, wall, { 200,200 }, 200, 200, 1, { 1.0f,1.0f,1.0f,1.0f }, rotation);
 			renderer.Submit(myTriangle, wall, { 400,400 }, 200, 200, 1, { 1.0f,1.0f,1.0f,1.0f }, rotation);
 			renderer.Submit(myTriangle, wall, { 600,600 }, 200, 200, 1, { 1.0f,1.0f,1.0f,1.0f }, rotation);
 			renderer.Submit(myOtherObject, wood, { 500,500 }, 100, 100, 0, { 1.0f,1.0f,1.0f,1.0f }, rotation);
+			// effectID, basePosition, offsetRadius (jitter so multiple spawns scatter instead of
+			// stacking), velocity, lifetime, color.
+			renderer.RequestSpawn(linearEffect, { 300,300 }, 20.0f, { 0.0f, -50.0f }, 5.0f, { 1.0f, 0.6f, 0.1f, 1.0f });
+			// velocity.y is repurposed as wave AMPLITUDE by WaveParticles.hlsl, not a real
+			// vertical speed -- see that file's comment.
+			renderer.RequestSpawn(waveEffect, { 900,300 }, 20.0f, { 30.0f, 60.0f }, 5.0f, { 0.2f, 0.6f, 1.0f, 1.0f });
+
 			checkpoint("spritesTask: end");
 			});
 		checkpoint("spritesTask created");
@@ -163,15 +184,20 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		dag.AddDependency(textNode, startNode);
 		checkpoint("textNode wired");
 
-		// (future systems, e.g. particles: same pattern -- CreateMainNode + AddDependency(startNode),
-		//  then AddDependency(presentNode, particlesNode) below, no exceptions)
+		core.m_UpdateParticlesCtx = { &core };
+		auto* particlesTask = scheduler.CreateTask(RendererCore::UpdateParticlesTask, &core.m_UpdateParticlesCtx);
+		checkpoint("particlesTask created");
+		auto* particlesNode = dag.CreateMainNode(particlesTask);
+		dag.AddDependency(particlesNode, startNode);
+		checkpoint("particlesNode wired");
 
-		renderer.m_PresentFrameCtx = { &renderer };
-		auto* presentTask = scheduler.CreateTask(Renderer::PresentFrameTask, &renderer.m_PresentFrameCtx);
+		core.m_PresentFrameCtx = { &core };
+		auto* presentTask = scheduler.CreateTask(RendererCore::PresentFrameTask, &core.m_PresentFrameCtx);
 		checkpoint("presentTask created");
 		auto* presentNode = dag.CreateMainNode(presentTask);
 		dag.AddDependency(presentNode, spritesNode);
 		dag.AddDependency(presentNode, textNode);
+		dag.AddDependency(presentNode, particlesNode);
 		checkpoint("presentNode wired");
 
 		T_Threads::WaitGroup frameWg;
@@ -186,7 +212,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		++frameNum;
 	}                               // continuous render loop
 
-	renderer.Cleanup();                                  // flush the GPU, close the fence event
+	core.Cleanup();                                       // flush the GPU, close the fence event
 	CoUninitialize();
 	return 0;
 }

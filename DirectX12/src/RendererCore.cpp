@@ -1,0 +1,931 @@
+#include "../include/RendererCore.h"
+#include "../include/Renderer.h"     // Renderer2D -- PresentFrame collects its draw lists
+#include "../include/Helpers.h"      // ThrowIfFailed
+#include "../include/Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
+#include <T_Thread.h>
+#include <algorithm>      // std::max
+#include <cassert>
+#include <cstdio>         // swprintf_s
+#include <random>         // RequestSpawn/SeedParticlePool distributions
+
+using namespace Microsoft::WRL;
+
+// D3D12_UNORDERED_ACCESS_VIEW_DESC::Buffer::CounterOffsetInBytes MUST be a multiple of
+// D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT (4096) -- rounds dataSizeBytes up to the next 4096
+// boundary. Used by both RegisterParticleEffect (creates the buffer + UAV) and SeedParticlePool
+// (uploads into it) -- MUST compute the identical offset in both places, hence the shared helper
+// instead of duplicating the arithmetic.
+static UINT64 AlignUavCounterOffset(UINT64 dataSizeBytes) {
+	constexpr UINT64 kAlignment = D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
+	return (dataSizeBytes + kAlignment - 1) & ~(kAlignment - 1);
+}
+
+// ===========================================================================
+// Public lifecycle
+// ===========================================================================
+// Core-only bring-up: device, queue, swap chain, RTV heap, PRE/POST lists, fence, constant
+// buffers, and the particle system's shared setup. Renderer2D::Initialize(core) runs AFTER
+// this returns and builds its own GPU objects (root sig, PSO, instance buffer, SRV heap, font)
+// against the device/queue this created.
+void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWarp)
+{
+	DagCheckpoint("Core::Initialize: begin");
+	m_ClientWidth = width;
+	m_ClientHeight = height;
+	m_UseWarp = useWarp;
+	EnableDebugLayer();                 // must precede ANY device work
+	m_TearingSupported = CheckTearingSupport();
+	DagCheckpoint("Core::Initialize: after EnableDebugLayer/CheckTearingSupport");
+
+	ComPtr<IDXGIAdapter4> adapter = GetAdapter(m_UseWarp);   // 1. pick a GPU
+	m_Device = CreateDevice(adapter);    // 2. the device
+	DagCheckpoint("Core::Initialize: device created");
+
+	CreateConstantBuffers(); // Creates a buffer for each frame (CPU->GPU)
+	DagCheckpoint("Core::Initialize: constant buffers created");
+	m_CommandQueue = CreateCommandQueue(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Core::Initialize: command queue created");
+	m_SwapChain = CreateSwapChain(hWnd, m_ClientWidth, m_ClientHeight, NumFrames);
+	DagCheckpoint("Core::Initialize: swap chain created");
+
+	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex();
+	m_FrameResourceIndex = 0; // app-controlled sync-slot counter, independent of the swap chain
+
+	m_RTVDescriptorHeap = CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumFrames);
+	m_RTVDescriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	UpdateRenderTargetViews();
+	DagCheckpoint("Core::Initialize: RTVs created");
+
+	for (int i = 0; i < NumFrames; ++i)
+		m_CommandAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Core::Initialize: per-frame command allocators created");
+
+	m_CommandList = CreateCommandList(                       // PRE list
+		m_CommandAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Core::Initialize: PRE command list created");
+
+	for (int i = 0; i < NumFrames; ++i)
+		m_PostAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	m_PostList = CreateCommandList(
+		m_PostAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+	DagCheckpoint("Core::Initialize: POST command list created");
+
+	m_CommandQueue->SetName(L"MainQueue");
+	m_CommandList->SetName(L"PRE (clear+barrier)");
+	m_PostList->SetName(L"POST (present barrier)");
+
+	m_Fence = CreateFence();
+	m_FenceEvent = CreateEventHandle();
+	DagCheckpoint("Core::Initialize: fence created");
+
+	// --- Particle system: shared setup only ---
+	// Per-effect pools (particle/dead-list/spawn buffers, each pool's OWN update shader) are NOT
+	// created here -- call RegisterParticleEffect() after both Initialize() calls return.
+	InitializeParticleSystem();
+	for (int i = 0; i < NumFrames; ++i)
+		m_ComputeAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
+	m_ComputeList = CreateCommandList(m_ComputeAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+	m_ComputeList->SetName(L"Compute (particle update)");
+	DagCheckpoint("Core::Initialize: particle system shared setup created");
+
+	m_IsInitialized = true;
+}
+
+void RendererCore::BeginFrame(const float clearColor[4]) {
+	// TWO DIFFERENT indices, deliberately -- see m_FrameResourceIndex's declaration comment.
+	// frame: which rotating sync-slot (allocators, instance buffer) to reclaim/reuse.
+	// backBuffer: which actual swap-chain back buffer to transition/clear/render into.
+	const int frame = m_FrameResourceIndex;
+	const int backBuffer = m_CurrentBackBufferIndex;
+
+	// The allocators/command lists are reset per-frame and safe to reuse once the GPU has
+	// finished executing the previous use of that frame slot. But the instance buffer is
+	// *persistently mapped* and can be read by in-flight draws from multiple frames back.
+	// Wait on an earlier frame's fence to ensure >= 2 frames of latency before we reuse the
+	// instance buffer slot.
+	int safeFrame = (frame + NumFrames - 2) % NumFrames;
+	WaitForFenceValue(m_FrameFenceValues[frame]);        // allocator is safe to reset
+	WaitForFenceValue(m_FrameFenceValues[safeFrame]);    // instance buffer is safe to write
+
+	if (m_Renderer2D) m_Renderer2D->ResetWorkerAllocators(frame);
+
+	// PRE list (single-threaded): PRESENT -> RENDER_TARGET, then clear. The worker lists
+	// draw after this; the POST list (PresentFrame) transitions back to PRESENT. PRE/POST
+	// are SEPARATE lists from the workers so a worker's Reset() can't wipe the clear/barrier.
+	m_CommandAllocators[frame]->Reset();
+	m_CommandList->Reset(m_CommandAllocators[frame].Get(), nullptr);
+
+	auto toRT = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_BackBuffers[backBuffer].Get(),
+		D3D12_RESOURCE_STATE_PRESENT,
+		D3D12_RESOURCE_STATE_RENDER_TARGET);
+	m_CommandList->ResourceBarrier(1, &toRT);
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
+		m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
+	m_CommandList->ClearRenderTargetView(rtv, (FLOAT*)clearColor, 0, nullptr);
+
+	m_CommandList->Close(); // PRE complete; submitted first in PresentFrame
+}
+
+void RendererCore::PresentFrame() {
+	const int frame = m_FrameResourceIndex;       // sync-slot: allocators, cmdLists, fence value
+	const int backBuffer = m_CurrentBackBufferIndex; // which actual back buffer to present
+
+	// 2D pipeline: merge worker submissions and launch worker tasks to record draw commands in
+	// parallel (FlushBatchParallel handles everything including the GPU buffer upload via memcpy).
+	if (m_Renderer2D) m_Renderer2D->FlushBatchParallel();
+
+	// POST list: transition the back buffer back to PRESENT (single-threaded, executed last).
+	m_PostAllocators[frame]->Reset();
+	m_PostList->Reset(m_PostAllocators[frame].Get(), nullptr);
+	auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_BackBuffers[backBuffer].Get(),
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		D3D12_RESOURCE_STATE_PRESENT);
+	m_PostList->ResourceBarrier(1, &toPresent);
+	m_PostList->Close();
+
+	// Execute PRE + particle list + all 2D worker lists (LAYER-MAJOR, see Renderer2D::
+	// CollectCommandLists) + POST. This is the seam a future Renderer3D would plug into: another
+	// CollectCommandLists()-style call between the particle list and POST.
+	std::vector<ID3D12CommandList*> allLists;
+	allLists.push_back(m_CommandList.Get());  // PRE: clear + PRESENT->RENDER_TARGET
+	// Particle compute dispatch + point-list draw (see UpdateParticles/UpdateParticlesTask) --
+	// recorded by the particlesNode DAG task, closed but not yet submitted. Must run after PRE
+	// (needs the cleared, RENDER_TARGET-state back buffer) and before the sprite/text worker
+	// lists (so particles land underneath them, not on top).
+	allLists.push_back(m_ComputeList.Get());
+	if (m_Renderer2D) m_Renderer2D->CollectCommandLists(frame, allLists);
+	allLists.push_back(m_PostList.Get());     // POST: RENDER_TARGET->PRESENT
+	m_CommandQueue->ExecuteCommandLists((UINT)allLists.size(), allLists.data());
+
+	// Present, then ONE fence scheme (m_FrameFenceValues + Signal()). BeginFrame waits on
+	// m_FrameFenceValues[frame] before reusing this slot's allocators next time around.
+	HRESULT hrPresent = m_SwapChain->Present(m_VSync ? 1 : 0, 0);
+	if (FAILED(hrPresent)) {
+		// A TDR surfaces here as DEVICE_REMOVED/RESET. Dump DRED (which op/resource killed
+		// the GPU) BEFORE throwing, so we get the diagnosis instead of a bare crash.
+		if (hrPresent == DXGI_ERROR_DEVICE_REMOVED || hrPresent == DXGI_ERROR_DEVICE_RESET)
+			LogDeviceRemoved();
+		ThrowIfFailed(hrPresent);
+	}
+	m_FrameFenceValues[frame] = Signal();
+	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex(); // DXGI-controlled, for the NEXT frame's back buffer
+	m_FrameResourceIndex = (m_FrameResourceIndex + 1) % NumFrames;     // app-controlled, fully independent rotation
+
+	// CPU-side reset for next frame. Safe now: all worker RECORDING finished above (the GPU
+	// reads m_InstanceBuffer, not these vectors).
+	if (m_Renderer2D) m_Renderer2D->ClearWorkerBucketsAndResetPool();
+}
+
+void RendererCore::Resize(uint32_t width, uint32_t height)
+{
+	if (!m_IsInitialized) return;                  // ignore WM_SIZE before bring-up
+	if (m_ClientWidth == width && m_ClientHeight == height) return;
+
+	m_ClientWidth = std::max(1u, width);          // never a 0-sized back buffer
+	m_ClientHeight = std::max(1u, height);
+
+	Flush();                                       // GPU must not reference the buffers
+	for (int i = 0; i < NumFrames; ++i)
+	{
+		m_BackBuffers[i].Reset();                  // release before resizing the chain
+		// Flush() just guaranteed the GPU is FULLY idle, so every fence value is equally
+		// "reached" right now -- source from m_FrameResourceIndex for consistency with the
+		// rest of the sync-slot scheme.
+		m_FrameFenceValues[i] = m_FrameFenceValues[m_FrameResourceIndex];
+	}
+
+	DXGI_SWAP_CHAIN_DESC desc = {};
+	ThrowIfFailed(m_SwapChain->GetDesc(&desc));
+	ThrowIfFailed(m_SwapChain->ResizeBuffers(NumFrames, m_ClientWidth, m_ClientHeight,
+		desc.BufferDesc.Format, desc.Flags));
+
+	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex();
+	UpdateRenderTargetViews();
+}
+
+void RendererCore::Cleanup()
+{
+	if (!m_IsInitialized) return;
+	Flush();                                       // wait for the GPU to finish
+	if (m_FenceEvent) { ::CloseHandle(m_FenceEvent); m_FenceEvent = nullptr; }
+	m_IsInitialized = false;
+	// ComPtr members release themselves.
+}
+
+// ===========================================================================
+// Creation steps
+// ===========================================================================
+void RendererCore::CreateConstantBuffers() {
+	for (int i = 0; i < NumFrames; ++i) {
+		CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+		CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(ConstantBufferData));
+		ThrowIfFailed(m_Device->CreateCommittedResource(
+			&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_ConstantBuffers[i])
+		));
+		m_ConstantBuffers[i]->Map(0, nullptr, reinterpret_cast<void**>(&m_MappedConstantBufferData[i]));
+	}
+}
+
+ComPtr<IDXGIAdapter4> RendererCore::GetAdapter(bool useWarp)
+{
+	ComPtr<IDXGIFactory4> dxgiFactory;
+	UINT createFactoryFlags = 0;
+#if defined(_DEBUG)
+	createFactoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+#endif
+	ThrowIfFailed(CreateDXGIFactory2(createFactoryFlags, IID_PPV_ARGS(&dxgiFactory)));
+
+	ComPtr<IDXGIAdapter1> dxgiAdapter1;
+	ComPtr<IDXGIAdapter4> dxgiAdapter4;
+
+	if (useWarp)
+	{
+		ThrowIfFailed(dxgiFactory->EnumWarpAdapter(IID_PPV_ARGS(&dxgiAdapter1)));
+		ThrowIfFailed(dxgiAdapter1.As(&dxgiAdapter4));
+	}
+	else
+	{
+		SIZE_T maxDedicatedVideoMemory = 0;
+		for (UINT i = 0; dxgiFactory->EnumAdapters1(i, &dxgiAdapter1) != DXGI_ERROR_NOT_FOUND; ++i)
+		{
+			DXGI_ADAPTER_DESC1 desc;
+			dxgiAdapter1->GetDesc1(&desc);
+			if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
+				SUCCEEDED(D3D12CreateDevice(dxgiAdapter1.Get(), D3D_FEATURE_LEVEL_11_0,
+					__uuidof(ID3D12Device), nullptr)) &&
+				desc.DedicatedVideoMemory > maxDedicatedVideoMemory)
+			{
+				maxDedicatedVideoMemory = desc.DedicatedVideoMemory;
+				ThrowIfFailed(dxgiAdapter1.As(&dxgiAdapter4));
+			}
+		}
+	}
+	return dxgiAdapter4;
+}
+
+ComPtr<ID3D12Device2> RendererCore::CreateDevice(ComPtr<IDXGIAdapter4> adapter)
+{
+	ComPtr<ID3D12Device2> device;
+	ThrowIfFailed(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+#if defined(_DEBUG)
+	ComPtr<ID3D12InfoQueue> pInfoQueue;
+	if (SUCCEEDED(device.As(&pInfoQueue)))
+	{
+		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
+		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+		pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
+
+		D3D12_MESSAGE_SEVERITY Severities[] = { D3D12_MESSAGE_SEVERITY_INFO };
+		D3D12_MESSAGE_ID DenyIds[] = {
+			D3D12_MESSAGE_ID_CLEARRENDERTARGETVIEW_MISMATCHINGCLEARVALUE,
+			D3D12_MESSAGE_ID_MAP_INVALID_NULLRANGE,
+			D3D12_MESSAGE_ID_UNMAP_INVALID_NULLRANGE,
+		};
+		D3D12_INFO_QUEUE_FILTER NewFilter = {};
+		NewFilter.DenyList.NumSeverities = _countof(Severities);
+		NewFilter.DenyList.pSeverityList = Severities;
+		NewFilter.DenyList.NumIDs = _countof(DenyIds);
+		NewFilter.DenyList.pIDList = DenyIds;
+		ThrowIfFailed(pInfoQueue->PushStorageFilter(&NewFilter));
+	}
+#endif
+	return device;
+}
+
+ComPtr<ID3D12CommandQueue> RendererCore::CreateCommandQueue(D3D12_COMMAND_LIST_TYPE type)
+{
+	ComPtr<ID3D12CommandQueue> queue;
+	D3D12_COMMAND_QUEUE_DESC desc = {};
+	desc.Type = type;
+	desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+	desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+	desc.NodeMask = 0;
+
+	HRESULT hr = m_Device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue));
+	if (FAILED(hr)) {
+		char buf[256];
+		sprintf_s(buf, "CreateCommandQueue failed with HRESULT 0x%08X", hr);
+		MessageBoxA(NULL, buf, "Error", MB_OK);
+		throw std::runtime_error(buf);
+	}
+	return queue;
+}
+
+bool RendererCore::CheckTearingSupport()
+{
+	BOOL allowTearing = FALSE;
+	ComPtr<IDXGIFactory4> factory4;
+	if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4))))
+	{
+		ComPtr<IDXGIFactory5> factory5;
+		if (SUCCEEDED(factory4.As(&factory5)))
+		{
+			if (FAILED(factory5->CheckFeatureSupport(
+				DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))))
+				allowTearing = FALSE;
+		}
+	}
+	return allowTearing == TRUE;
+}
+
+ComPtr<IDXGISwapChain4> RendererCore::CreateSwapChain(HWND hWnd, uint32_t width, uint32_t height, uint32_t bufferCount)
+{
+	ComPtr<IDXGISwapChain4> dxgiSwapChain4;
+	ComPtr<IDXGIFactory4> dxgiFactory4;
+	UINT createFactoryFlags = 0;
+#if defined(_DEBUG)
+	createFactoryFlags = DXGI_CREATE_FACTORY_DEBUG;
+#endif
+	ThrowIfFailed(CreateDXGIFactory2(createFactoryFlags, IID_PPV_ARGS(&dxgiFactory4)));
+
+	DXGI_SWAP_CHAIN_DESC1 desc = {};
+	desc.Width = width;
+	desc.Height = height;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.Stereo = FALSE;
+	desc.SampleDesc = { 1, 0 };
+	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	desc.BufferCount = bufferCount;
+	desc.Scaling = DXGI_SCALING_STRETCH;
+	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+	desc.Flags = m_TearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+	ComPtr<IDXGISwapChain1> swapChain1;
+	ThrowIfFailed(dxgiFactory4->CreateSwapChainForHwnd(
+		m_CommandQueue.Get(), hWnd, &desc, nullptr, nullptr, &swapChain1));
+
+	// We handle Alt+Enter fullscreen ourselves.
+	ThrowIfFailed(dxgiFactory4->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER));
+	ThrowIfFailed(swapChain1.As(&dxgiSwapChain4));
+	return dxgiSwapChain4;
+}
+
+ComPtr<ID3D12DescriptorHeap> RendererCore::CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t numDescriptors)
+{
+	ComPtr<ID3D12DescriptorHeap> heap;
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	desc.NumDescriptors = numDescriptors;
+	desc.Type = type;
+
+	if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+		desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	else
+		desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+	ThrowIfFailed(m_Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)));
+	return heap;
+}
+
+void RendererCore::UpdateRenderTargetViews()
+{
+	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+	for (int i = 0; i < NumFrames; ++i)
+	{
+		ComPtr<ID3D12Resource> backBuffer;
+		ThrowIfFailed(m_SwapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffer)));
+		m_Device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtvHandle);
+		m_BackBuffers[i] = backBuffer;
+		rtvHandle.Offset(m_RTVDescriptorSize);
+	}
+}
+
+ComPtr<ID3D12CommandAllocator> RendererCore::CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type)
+{
+	ComPtr<ID3D12CommandAllocator> allocator;
+	ThrowIfFailed(m_Device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator)));
+	return allocator;
+}
+
+ComPtr<ID3D12GraphicsCommandList> RendererCore::CreateCommandList(ComPtr<ID3D12CommandAllocator> allocator, D3D12_COMMAND_LIST_TYPE type)
+{
+	ComPtr<ID3D12GraphicsCommandList> list;
+	ThrowIfFailed(m_Device->CreateCommandList(0, type, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+	ThrowIfFailed(list->Close());   // created in the "recording" state; close so Render can Reset it
+	return list;
+}
+
+ComPtr<ID3D12Fence> RendererCore::CreateFence()
+{
+	ComPtr<ID3D12Fence> fence;
+	ThrowIfFailed(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+	return fence;
+}
+
+HANDLE RendererCore::CreateEventHandle()
+{
+	HANDLE fenceEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+	assert(fenceEvent && "Failed to create fence event.");
+	return fenceEvent;
+}
+
+// ===========================================================================
+// Synchronization
+// ===========================================================================
+uint64_t RendererCore::Signal()
+{
+	uint64_t valueForSignal = ++m_FenceValue;
+	ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), valueForSignal));
+	return valueForSignal;
+}
+
+namespace {
+	// Carries the per-wait state for the GPU-fence -> fiber bridge. One Win32 event per wait
+	// (not a shared one) so overlapping waits can't stomp each other. The DirectEvent* is the
+	// pooled rendezvous handed to us by WaitOnEventDirectArmed -- we signal it by pointer, so
+	// there is no name lookup / registry / global lock on the wakeup path.
+	struct FenceWaitCtx {
+		HANDLE      win32Event = nullptr;
+		HANDLE      waitHandle = nullptr;
+		T_Threads::DirectEvent* evt = nullptr;
+	};
+	VOID CALLBACK FenceWaitCallback(PVOID param, BOOLEAN /*timedOut*/) {
+		auto* c = static_cast<FenceWaitCtx*>(param);
+		c->evt->Signal();
+		::UnregisterWaitEx(c->waitHandle, nullptr); // one-shot, non-blocking cleanup
+		::CloseHandle(c->win32Event);
+		delete c;
+	}
+}
+
+void RendererCore::WaitForFenceValue(uint64_t value, std::chrono::milliseconds dur)
+{
+	if (m_Fence->GetCompletedValue() >= value)
+		return; // already complete -- no wait
+
+	auto& sched = T_Threads::TaskScheduler::Instance();
+	if (sched.IsOnFiber()) {
+		// On a fiber: SUSPEND it (freeing the worker to run other jobs) until the GPU
+		// reaches 'value'. Direct/handle event: no name, no eventRegistry, no registryMtx.
+		while (m_Fence->GetCompletedValue() < value) {
+			sched.WaitOnEventDirectArmed([this, value](T_Threads::DirectEvent* e) {
+				auto* c = new FenceWaitCtx();
+				c->evt        = e;
+				c->win32Event = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
+				ThrowIfFailed(m_Fence->SetEventOnCompletion(value, c->win32Event));
+				::RegisterWaitForSingleObject(&c->waitHandle, c->win32Event,
+					FenceWaitCallback, c, INFINITE, WT_EXECUTEONLYONCE);
+			});
+		}
+		return;
+	}
+
+	// Off-fiber (main thread, Resize/Cleanup): plain blocking wait -- no spin, 0% CPU.
+	ThrowIfFailed(m_Fence->SetEventOnCompletion(value, m_FenceEvent));
+	::WaitForSingleObject(m_FenceEvent, static_cast<DWORD>(dur.count()));
+}
+
+void RendererCore::Flush()
+{
+	uint64_t valueForSignal = Signal();
+	WaitForFenceValue(valueForSignal);
+}
+
+// ===========================================================================
+// Debug + diagnostics
+// ===========================================================================
+void RendererCore::EnableDebugLayer()
+{
+#if defined(_DEBUG)
+	// Catch DX12 usage errors at creation time. Must run before any device is made.
+	ComPtr<ID3D12Debug> debugInterface;
+	ThrowIfFailed(D3D12GetDebugInterface(IID_PPV_ARGS(&debugInterface)));
+	debugInterface->EnableDebugLayer();
+
+	// GPU-Based Validation: validates resource states / descriptors / command buffers on the
+	// GPU TIMELINE and reports violations in USER MODE (VS Output window) BEFORE they reach
+	// the kernel driver. SLOW; debug-only.
+	ComPtr<ID3D12Debug1> debug1;
+	if (SUCCEEDED(debugInterface.As(&debug1)))
+	{
+		debug1->SetEnableGPUBasedValidation(TRUE);
+		debug1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+	}
+#endif
+	// DRED (Device Removed Extended Data): on a TDR / device-removed, this records the GPU's
+	// command "breadcrumbs" and the faulting virtual address. MUST be set before the device is
+	// created. Enabled in all configs so a Release crash is diagnosable too.
+	ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+	if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings))))
+	{
+		dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+		dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	}
+}
+
+// Dump DRED data after a device-removed. Call this when a GPU submit/present/fence returns
+// DXGI_ERROR_DEVICE_REMOVED/HUNG -- the output goes to the VS Output window.
+void RendererCore::LogDeviceRemoved()
+{
+	char line[256];
+	HRESULT reason = m_Device ? m_Device->GetDeviceRemovedReason() : E_FAIL;
+	sprintf_s(line, "\n*** DEVICE REMOVED. reason = 0x%08lX\n", (unsigned long)reason);
+	OutputDebugStringA(line);
+
+	ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+	if (!m_Device || FAILED(m_Device->QueryInterface(IID_PPV_ARGS(&dred))))
+	{
+		OutputDebugStringA("  (DRED interface unavailable)\n");
+		return;
+	}
+
+	D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+	if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs)))
+	{
+		const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+		while (node)
+		{
+			UINT last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+			if (last == node->BreadcrumbCount) { node = node->pNext; continue; }
+			sprintf_s(line, "  [breadcrumb] list='%S' queue='%S' completedOps=%u / %u\n",
+				node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"?",
+				node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"?",
+				last, node->BreadcrumbCount);
+			OutputDebugStringA(line);
+			if (node->pCommandHistory && last < node->BreadcrumbCount)
+			{
+				sprintf_s(line, "        died on op #%u = %d\n", last, (int)node->pCommandHistory[last]);
+				OutputDebugStringA(line);
+			}
+			node = node->pNext;
+		}
+	}
+
+	D3D12_DRED_PAGE_FAULT_OUTPUT pageFault{};
+	if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pageFault)))
+	{
+		sprintf_s(line, "  [pagefault] VA = 0x%llX\n", (unsigned long long)pageFault.PageFaultVA);
+		OutputDebugStringA(line);
+		for (auto* n = pageFault.pHeadExistingAllocationNode; n; n = n->pNext)
+		{
+			sprintf_s(line, "        live   alloc '%S' type=%d\n",
+				n->ObjectNameW ? n->ObjectNameW : L"?", (int)n->AllocationType);
+			OutputDebugStringA(line);
+		}
+		for (auto* n = pageFault.pHeadRecentFreedAllocationNode; n; n = n->pNext)
+		{
+			sprintf_s(line, "        freed  alloc '%S' type=%d  <-- recently freed near the fault\n",
+				n->ObjectNameW ? n->ObjectNameW : L"?", (int)n->AllocationType);
+			OutputDebugStringA(line);
+		}
+	}
+	OutputDebugStringA("*** end DRED dump\n");
+}
+
+void RendererCore::ExecuteUploadCommand(std::function<void(ID3D12GraphicsCommandList*)> task) {
+	m_CommandList->Reset(m_CommandAllocators[m_FrameResourceIndex].Get(), nullptr);
+	task(m_CommandList.Get());
+	m_CommandList->Close();
+	ID3D12CommandList* ppCommandLists[] = { m_CommandList.Get() };
+	m_CommandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+	Flush(); // Wait for GPU to finish the upload
+}
+
+void RendererCore::UpdateGlobalUniforms(DirectX::XMFLOAT2 screenSize) {
+	float ar = screenSize.x / (screenSize.y > 0.0f ? screenSize.y : 1.0f);
+	// Sync-rotation slot (m_FrameResourceIndex), not the swap-chain back-buffer index -- this
+	// constant buffer is a CPU/GPU-sync resource, unrelated to which back buffer is on screen.
+	ConstantBufferData* pData = reinterpret_cast<ConstantBufferData*>(m_MappedConstantBufferData[m_FrameResourceIndex]);
+	pData->screenSize = screenSize;
+	pData->aspectRatio = ar;
+}
+
+DirectX::XMFLOAT2 RendererCore::GetScreenSize() const {
+	return DirectX::XMFLOAT2(static_cast<float>(m_ClientWidth), static_cast<float>(m_ClientHeight));
+}
+
+DirectX::XMFLOAT2 RendererCore::GetNDC(float targetX, float targetY)
+{
+	DirectX::XMFLOAT2 ndc;
+	ndc.x = (targetX / (m_ClientWidth / 2.0f)) - 1.0f;
+	ndc.y = 1.0f - (targetY / (m_ClientHeight / 2.0f));
+	return ndc;
+}
+
+// ===========================================================================
+// Particle system
+// ===========================================================================
+void RendererCore::InitializeParticleSystem() {
+	m_ComputeRootSignature = CreateComputeRootSignature();
+	m_SpawnPSO = CreateComputePipelineState(L"SpawnParticles.cso"); // shared -- popping a dead slot is identical regardless of pool
+	m_ParticleRootSignature = CreateParticleRootSignature();
+	m_ParticlePSO = CreateParticlePipelineState(L"ParticleVS.cso", L"ParticlePS.cso"); // shared draw shader for now
+}
+
+uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles) {
+	ParticleEffectPool pool;
+	pool.maxParticles = maxParticles;
+
+	D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT };
+	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+		(UINT64)maxParticles * sizeof(Particle), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.particleBuffer)
+	));
+
+	const UINT64 deadListDataSize = (UINT64)maxParticles * sizeof(uint32_t);
+	const UINT64 deadListCounterOffset = AlignUavCounterOffset(deadListDataSize);
+	D3D12_RESOURCE_DESC deadListDesc = CD3DX12_RESOURCE_DESC::Buffer(
+		deadListCounterOffset + sizeof(uint32_t), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &deadListDesc,
+		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.deadListBuffer)
+	));
+
+	D3D12_DESCRIPTOR_HEAP_DESC uavHeapDesc = {};
+	uavHeapDesc.NumDescriptors = 2;
+	uavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	uavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(m_Device->CreateDescriptorHeap(&uavHeapDesc, IID_PPV_ARGS(&pool.uavHeap)));
+	const UINT uavDescSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+	uavDesc.Buffer.NumElements = maxParticles;
+	uavDesc.Buffer.StructureByteStride = sizeof(Particle);
+	m_Device->CreateUnorderedAccessView(pool.particleBuffer.Get(), nullptr, &uavDesc, pool.uavHeap->GetCPUDescriptorHandleForHeapStart());
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC deadListUavDesc = {};
+	deadListUavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	deadListUavDesc.Format = DXGI_FORMAT_UNKNOWN;
+	deadListUavDesc.Buffer.NumElements = maxParticles;
+	deadListUavDesc.Buffer.StructureByteStride = sizeof(uint32_t);
+	deadListUavDesc.Buffer.CounterOffsetInBytes = deadListCounterOffset;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE deadListHandle(pool.uavHeap->GetCPUDescriptorHandleForHeapStart(), 1, uavDescSize);
+	m_Device->CreateUnorderedAccessView(pool.deadListBuffer.Get(), pool.deadListBuffer.Get(), &deadListUavDesc, deadListHandle);
+
+	auto spawnBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(1024 * sizeof(Particle));
+	CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&uploadHeapProps, D3D12_HEAP_FLAG_NONE, &spawnBufferDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&pool.spawnBuffer)
+	));
+
+	pool.updatePSO = CreateComputePipelineState(updateCsPath);
+
+	m_ParticleEffects.push_back(std::move(pool));
+	uint32_t effectID = (uint32_t)m_ParticleEffects.size() - 1;
+
+	ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
+		SeedParticlePool(m_ParticleEffects[effectID], cmd);
+	});
+	m_ParticleEffects[effectID].particleUploadBuffer.Reset();
+	m_ParticleEffects[effectID].deadListUploadBuffer.Reset();
+
+	return effectID;
+}
+
+Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateComputeRootSignature() {
+	D3D12_DESCRIPTOR_RANGE uavRange = {};
+	uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	uavRange.NumDescriptors = 2;
+	uavRange.BaseShaderRegister = 0;
+
+	D3D12_ROOT_PARAMETER params[3];
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[0].DescriptorTable.NumDescriptorRanges = 1;
+	params[0].DescriptorTable.pDescriptorRanges = &uavRange;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+	params[1].Descriptor.ShaderRegister = 1; // t1
+	params[1].Descriptor.RegisterSpace = 0;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[2].Constants.ShaderRegister = 0; // b0
+	params[2].Constants.RegisterSpace = 0;
+	params[2].Constants.Num32BitValues = 3;
+	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_ROOT_SIGNATURE_DESC desc = { _countof(params), params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+	ComPtr<ID3DBlob> signature, error;
+	D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+
+	ComPtr<ID3D12RootSignature> rootSig;
+	m_Device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+	return rootSig;
+}
+
+Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateComputePipelineState(const std::wstring& csPath) {
+	auto csBlob = ReadFile(ExeRelative(csPath));
+	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = m_ComputeRootSignature.Get();
+	psoDesc.CS = { csBlob.data(), csBlob.size() };
+	ComPtr<ID3D12PipelineState> pso;
+	ThrowIfFailed(m_Device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)));
+	return pso;
+}
+
+Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateParticleRootSignature() {
+	CD3DX12_ROOT_PARAMETER rootParameters[2];
+	rootParameters[0].InitAsConstantBufferView(0);
+	rootParameters[1].InitAsShaderResourceView(0, 0);
+
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
+	rsDesc.Init(_countof(rootParameters), rootParameters, 0, nullptr,
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+	ComPtr<ID3DBlob> signature, error;
+	ThrowIfFailed(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error));
+
+	ComPtr<ID3D12RootSignature> rootSig;
+	ThrowIfFailed(m_Device->CreateRootSignature(0, signature->GetBufferPointer(),
+		signature->GetBufferSize(), IID_PPV_ARGS(&rootSig)));
+	return rootSig;
+}
+
+Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateParticlePipelineState(
+	const std::wstring& vsPath, const std::wstring& psPath) {
+	auto vsBlob = ReadFile(ExeRelative(vsPath));
+	auto psBlob = ReadFile(ExeRelative(psPath));
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = m_ParticleRootSignature.Get();
+	psoDesc.VS = { vsBlob.data(), vsBlob.size() };
+	psoDesc.PS = { psBlob.data(), psBlob.size() };
+	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	psoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+	psoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	psoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	psoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+	psoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+	psoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+	psoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	psoDesc.SampleMask = UINT_MAX;
+	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	psoDesc.DepthStencilState.DepthEnable = FALSE;
+	psoDesc.DepthStencilState.StencilEnable = FALSE;
+	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+	psoDesc.NumRenderTargets = 1;
+	psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	psoDesc.SampleDesc.Count = 1;
+
+	ComPtr<ID3D12PipelineState> pso;
+	ThrowIfFailed(m_Device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso)));
+	return pso;
+}
+
+void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsCommandList* cmd) {
+	std::vector<Particle> initial(pool.maxParticles);
+	std::mt19937 rng(12345);
+	std::uniform_real_distribution<float> posX(0.0f, (float)m_ClientWidth);
+	std::uniform_real_distribution<float> posY(0.0f, (float)m_ClientHeight);
+	std::uniform_real_distribution<float> vel(-50.0f, 50.0f);
+	for (auto& p : initial) {
+		p.position = { posX(rng), posY(rng) };
+		p.velocity = { vel(rng), vel(rng) };
+		p.lifetime = 5.0f;
+		p.age = 0.0f;
+		p.isActive = 0; // inactive until a spawn claims this slot
+		p.padding = 0;
+		p.color = { 1,1,1,1 };
+	}
+
+	const UINT64 bufferSize = (UINT64)pool.maxParticles * sizeof(Particle);
+	CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+	CD3DX12_RESOURCE_DESC uploadDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&uploadHeapProps, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&pool.particleUploadBuffer)));
+
+	void* mapped = nullptr;
+	ThrowIfFailed(pool.particleUploadBuffer->Map(0, nullptr, &mapped));
+	memcpy(mapped, initial.data(), bufferSize);
+	pool.particleUploadBuffer->Unmap(0, nullptr);
+
+	auto toDest = CD3DX12_RESOURCE_BARRIER::Transition(pool.particleBuffer.Get(),
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+	cmd->ResourceBarrier(1, &toDest);
+	cmd->CopyBufferRegion(pool.particleBuffer.Get(), 0, pool.particleUploadBuffer.Get(), 0, bufferSize);
+	auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(pool.particleBuffer.Get(),
+		D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	cmd->ResourceBarrier(1, &toSRV);
+
+	const UINT64 deadListDataSize = (UINT64)pool.maxParticles * sizeof(uint32_t);
+	const UINT64 deadListCounterOffset = AlignUavCounterOffset(deadListDataSize);
+	const UINT64 deadListUploadSize = deadListCounterOffset + sizeof(uint32_t);
+
+	std::vector<uint32_t> deadListInit(deadListUploadSize / sizeof(uint32_t), 0); // zero-fills the padding gap
+	for (uint32_t idx = 0; idx < pool.maxParticles; ++idx) deadListInit[idx] = idx;
+	deadListInit[deadListCounterOffset / sizeof(uint32_t)] = pool.maxParticles; // the counter value
+	CD3DX12_HEAP_PROPERTIES counterUploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+	CD3DX12_RESOURCE_DESC counterUploadDesc = CD3DX12_RESOURCE_DESC::Buffer(deadListUploadSize);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&counterUploadHeapProps, D3D12_HEAP_FLAG_NONE, &counterUploadDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&pool.deadListUploadBuffer)));
+	void* counterMapped = nullptr;
+	ThrowIfFailed(pool.deadListUploadBuffer->Map(0, nullptr, &counterMapped));
+	memcpy(counterMapped, deadListInit.data(), deadListUploadSize);
+	pool.deadListUploadBuffer->Unmap(0, nullptr);
+
+	auto deadListToDest = CD3DX12_RESOURCE_BARRIER::Transition(pool.deadListBuffer.Get(),
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+	cmd->ResourceBarrier(1, &deadListToDest);
+	cmd->CopyBufferRegion(pool.deadListBuffer.Get(), 0, pool.deadListUploadBuffer.Get(), 0, deadListUploadSize);
+	auto deadListToUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.deadListBuffer.Get(),
+		D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	cmd->ResourceBarrier(1, &deadListToUAV);
+}
+
+void RendererCore::UpdateParticles() {
+	const int frame = m_FrameResourceIndex;
+	const int backBuffer = m_CurrentBackBufferIndex;
+
+	m_ComputeAllocators[frame]->Reset();
+	m_ComputeList->Reset(m_ComputeAllocators[frame].Get(), nullptr); // PSO set per pool below
+
+	for (auto& pool : m_ParticleEffects) {
+		const UINT spawnCount = (UINT)pool.pendingSpawns.size();
+		FlushSpawns(pool);
+
+		// --- Compute pass: advance every particle in THIS pool (ONE dispatch) ---
+		auto toUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.particleBuffer.Get(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		m_ComputeList->ResourceBarrier(1, &toUAV);
+
+		ID3D12DescriptorHeap* computeHeaps[] = { pool.uavHeap.Get() };
+		m_ComputeList->SetDescriptorHeaps(1, computeHeaps);
+		m_ComputeList->SetComputeRootSignature(m_ComputeRootSignature.Get());
+		m_ComputeList->SetPipelineState(pool.updatePSO.Get()); // THIS pool's own behavior shader
+		m_ComputeList->SetComputeRootDescriptorTable(0, pool.uavHeap->GetGPUDescriptorHandleForHeapStart());
+		m_ComputeList->SetComputeRootShaderResourceView(1, pool.spawnBuffer->GetGPUVirtualAddress());
+
+		float dt = GetLastDeltaTime();
+		UINT computeConstants[3] = { *reinterpret_cast<UINT*>(&dt), spawnCount, pool.maxParticles };
+		m_ComputeList->SetComputeRoot32BitConstants(2, 3, computeConstants, 0);
+
+		const UINT groupCount = (pool.maxParticles + 255) / 256;
+		m_ComputeList->Dispatch(groupCount, 1, 1);
+
+		if (spawnCount > 0) {
+			auto killToSpawnBarrier = CD3DX12_RESOURCE_BARRIER::UAV(pool.particleBuffer.Get());
+			m_ComputeList->ResourceBarrier(1, &killToSpawnBarrier);
+
+			m_ComputeList->SetPipelineState(m_SpawnPSO.Get());
+			const UINT spawnGroupCount = (spawnCount + 255) / 256;
+			m_ComputeList->Dispatch(spawnGroupCount, 1, 1);
+		}
+
+		auto uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(pool.particleBuffer.Get());
+		m_ComputeList->ResourceBarrier(1, &uavBarrier);
+		auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(pool.particleBuffer.Get(),
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		m_ComputeList->ResourceBarrier(1, &toSRV);
+
+		// --- Draw pass: one point per particle in THIS pool (SHARED draw PSO) ---
+		m_ComputeList->SetGraphicsRootSignature(m_ParticleRootSignature.Get());
+		m_ComputeList->SetPipelineState(m_ParticlePSO.Get());
+		m_ComputeList->SetGraphicsRootConstantBufferView(0, m_ConstantBuffers[frame]->GetGPUVirtualAddress());
+		m_ComputeList->SetGraphicsRootShaderResourceView(1, pool.particleBuffer->GetGPUVirtualAddress());
+
+		CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
+			m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
+		m_ComputeList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		D3D12_VIEWPORT viewport = { 0.0f, 0.0f, (float)m_ClientWidth, (float)m_ClientHeight, 0.0f, 1.0f };
+		D3D12_RECT scissor = { 0, 0, (LONG)m_ClientWidth, (LONG)m_ClientHeight };
+		m_ComputeList->RSSetViewports(1, &viewport);
+		m_ComputeList->RSSetScissorRects(1, &scissor);
+		m_ComputeList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+		m_ComputeList->DrawInstanced(1, pool.maxParticles, 0, 0);
+	}
+
+	ThrowIfFailed(m_ComputeList->Close());
+}
+
+void RendererCore::RequestSpawn(uint32_t effectID, Particle p) {
+	auto& pool = m_ParticleEffects[effectID];
+	if (pool.pendingSpawns.size() < 1024) {
+		pool.pendingSpawns.push_back(p);
+	}
+}
+
+void RendererCore::RequestSpawn(uint32_t effectID, DirectX::XMFLOAT2 basePosition, float offsetRadius,
+	DirectX::XMFLOAT2 velocity, float lifetime, DirectX::XMFLOAT4 color) {
+	static std::mt19937 rng(std::random_device{}());
+	std::uniform_real_distribution<float> jitter(-offsetRadius, offsetRadius);
+
+	Particle p{};
+	p.position = { basePosition.x + jitter(rng), basePosition.y + jitter(rng) };
+	p.velocity = velocity;
+	p.lifetime = lifetime;
+	p.color = color;
+	RequestSpawn(effectID, p);
+}
+
+void RendererCore::FlushSpawns(ParticleEffectPool& pool) {
+	if (pool.pendingSpawns.empty()) return;
+	void* mapped = nullptr;
+	pool.spawnBuffer->Map(0, nullptr, &mapped);
+	memcpy(mapped, pool.pendingSpawns.data(), pool.pendingSpawns.size() * sizeof(Particle));
+	pool.spawnBuffer->Unmap(0, nullptr);
+	pool.pendingSpawns.clear();
+}
