@@ -6,16 +6,13 @@
 [numthreads(256, 1, 1)]
 void main(uint3 DTid : SV_DispatchThreadID)
 {
-    uint i = DTid.x;
-    if (i >= maxParticles) return;
+    uint i;
+    if (!ResolveAliveIndex(DTid.x, i)) return;
 
-    if (ParticleBuffer[i].isActive == 1)
-    {
-        ParticleBuffer[i].position += ParticleBuffer[i].velocity * DeltaTime;
-        ParticleBuffer[i].lifetime -= DeltaTime;
-        ParticleBuffer[i].age += DeltaTime;
+    ParticleBuffer[i].position += ParticleBuffer[i].velocity * DeltaTime;
+    ParticleBuffer[i].lifetime -= DeltaTime;
+    ParticleBuffer[i].age += DeltaTime;
 
-        if (ParticleBuffer[i].lifetime <= 0)
-            KillParticle(i);
-    }
+    if (ParticleBuffer[i].lifetime <= 0)
+        KillParticle(i);
 }

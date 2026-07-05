@@ -40,7 +40,7 @@ private:
     std::unordered_map<int, Glyph> glyphs;
     std::map<std::pair<int, int>, float> kerning;
 
-    TextureResource* texture = nullptr;
+    TextureHandle texture;
     Mesh unitQuad{};
     float scaleW = 1.0f, scaleH = 1.0f;
     float lineHeight = 0.0f;

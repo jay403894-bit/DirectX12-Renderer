@@ -3,6 +3,7 @@
 #include "../include/Helpers.h"      // ThrowIfFailed
 #include "../include/Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
 #include <T_Thread.h>
+#include <TaskScheduler.h> // T_Threads::TaskScheduler::Instance()/WaitOnEventDirectArmed -- previously pulled in transitively via Renderer2D.h
 #include <algorithm>      // std::max
 #include <cassert>
 #include <cstdio>         // swprintf_s
@@ -19,7 +20,12 @@ static UINT64 AlignUavCounterOffset(UINT64 dataSizeBytes) {
 	constexpr UINT64 kAlignment = D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
 	return (dataSizeBytes + kAlignment - 1) & ~(kAlignment - 1);
 }
-
+RendererCore::RendererCore()
+{}
+RendererCore::~RendererCore()
+{
+	if (m_IsInitialized) Cleanup();
+}
 // ===========================================================================
 // Public lifecycle
 // ===========================================================================
@@ -29,24 +35,18 @@ static UINT64 AlignUavCounterOffset(UINT64 dataSizeBytes) {
 // against the device/queue this created.
 void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWarp)
 {
-	DagCheckpoint("Core::Initialize: begin");
 	m_ClientWidth = width;
 	m_ClientHeight = height;
 	m_UseWarp = useWarp;
 	EnableDebugLayer();                 // must precede ANY device work
 	m_TearingSupported = CheckTearingSupport();
-	DagCheckpoint("Core::Initialize: after EnableDebugLayer/CheckTearingSupport");
 
 	ComPtr<IDXGIAdapter4> adapter = GetAdapter(m_UseWarp);   // 1. pick a GPU
 	m_Device = CreateDevice(adapter);    // 2. the device
-	DagCheckpoint("Core::Initialize: device created");
 
 	CreateConstantBuffers(); // Creates a buffer for each frame (CPU->GPU)
-	DagCheckpoint("Core::Initialize: constant buffers created");
 	m_CommandQueue = CreateCommandQueue(D3D12_COMMAND_LIST_TYPE_DIRECT);
-	DagCheckpoint("Core::Initialize: command queue created");
 	m_SwapChain = CreateSwapChain(hWnd, m_ClientWidth, m_ClientHeight, NumFrames);
-	DagCheckpoint("Core::Initialize: swap chain created");
 
 	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex();
 	m_FrameResourceIndex = 0; // app-controlled sync-slot counter, independent of the swap chain
@@ -54,21 +54,17 @@ void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool u
 	m_RTVDescriptorHeap = CreateDescriptorHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumFrames);
 	m_RTVDescriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	UpdateRenderTargetViews();
-	DagCheckpoint("Core::Initialize: RTVs created");
 
 	for (int i = 0; i < NumFrames; ++i)
 		m_CommandAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
-	DagCheckpoint("Core::Initialize: per-frame command allocators created");
 
 	m_CommandList = CreateCommandList(                       // PRE list
 		m_CommandAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
-	DagCheckpoint("Core::Initialize: PRE command list created");
 
 	for (int i = 0; i < NumFrames; ++i)
 		m_PostAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
 	m_PostList = CreateCommandList(
 		m_PostAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
-	DagCheckpoint("Core::Initialize: POST command list created");
 
 	m_CommandQueue->SetName(L"MainQueue");
 	m_CommandList->SetName(L"PRE (clear+barrier)");
@@ -76,7 +72,6 @@ void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool u
 
 	m_Fence = CreateFence();
 	m_FenceEvent = CreateEventHandle();
-	DagCheckpoint("Core::Initialize: fence created");
 
 	// --- Particle system: shared setup only ---
 	// Per-effect pools (particle/dead-list/spawn buffers, each pool's OWN update shader) are NOT
@@ -86,7 +81,6 @@ void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool u
 		m_ComputeAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
 	m_ComputeList = CreateCommandList(m_ComputeAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
 	m_ComputeList->SetName(L"Compute (particle update)");
-	DagCheckpoint("Core::Initialize: particle system shared setup created");
 
 	m_IsInitialized = true;
 }
@@ -615,18 +609,38 @@ DirectX::XMFLOAT2 RendererCore::GetNDC(float targetX, float targetY)
 void RendererCore::InitializeParticleSystem() {
 	m_ComputeRootSignature = CreateComputeRootSignature();
 	m_SpawnPSO = CreateComputePipelineState(L"SpawnParticles.cso"); // shared -- popping a dead slot is identical regardless of pool
+	m_ResetAliveCounterPSO = CreateComputePipelineState(L"ResetAliveCounter.cso"); // shared
+	m_CompactPSO = CreateComputePipelineState(L"CompactParticles.cso"); // shared
 	m_ParticleRootSignature = CreateParticleRootSignature();
 	m_ParticlePSO = CreateParticlePipelineState(L"ParticleVS.cso", L"ParticlePS.cso"); // shared draw shader for now
+
+	m_ArgsRootSignature = CreateArgsRootSignature();
+	m_BuildArgsPSO = CreateComputePipelineState(L"BuildDispatchArgs.cso", m_ArgsRootSignature.Get());
+
+	D3D12_INDIRECT_ARGUMENT_DESC dispatchArg = {};
+	dispatchArg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+	D3D12_COMMAND_SIGNATURE_DESC cmdSigDesc = {};
+	cmdSigDesc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+	cmdSigDesc.NumArgumentDescs = 1;
+	cmdSigDesc.pArgumentDescs = &dispatchArg;
+	// pRootSignature is only required when the command signature also patches root
+	// constants/descriptors indirectly -- a pure DISPATCH signature doesn't touch the root
+	// signature at all, so nullptr is correct here.
+	ThrowIfFailed(m_Device->CreateCommandSignature(&cmdSigDesc, nullptr, IID_PPV_ARGS(&m_DispatchCommandSignature)));
 }
 
-uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, int zLayer) {
+uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, int zLayer,
+	TextureHandle texture, uint32_t atlasFramesX, uint32_t atlasFramesY, DirectX::XMFLOAT4 colorEnd) {
 	ParticleEffectPool pool;
 	pool.maxParticles = maxParticles;
 	pool.zLayer = zLayer;
+	pool.atlasFramesX = atlasFramesX;
+	pool.atlasFramesY = atlasFramesY;
+	pool.colorEnd = colorEnd;
 
 	D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
-		(UINT64)maxParticles * sizeof(Particle), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+		(UINT64)maxParticles * sizeof(Particle2D), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
 	ThrowIfFailed(m_Device->CreateCommittedResource(
 		&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
 		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.particleBuffer)
@@ -641,8 +655,21 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.deadListBuffer)
 	));
 
+	// aliveListBuffer: same shape as deadListBuffer (maxParticles uints + a hidden UAV counter) --
+	// rebuilt from scratch every frame (Reset then Compact), unlike deadList which persists/
+	// recycles across frames.
+	const UINT64 aliveListDataSize = (UINT64)maxParticles * sizeof(uint32_t);
+	const UINT64 aliveListCounterOffset = AlignUavCounterOffset(aliveListDataSize);
+	D3D12_RESOURCE_DESC aliveListDesc = CD3DX12_RESOURCE_DESC::Buffer(
+		aliveListCounterOffset + sizeof(uint32_t), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &aliveListDesc,
+		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.aliveListBuffer)
+	));
+	pool.aliveListCounterOffset = aliveListCounterOffset;
+
 	D3D12_DESCRIPTOR_HEAP_DESC uavHeapDesc = {};
-	uavHeapDesc.NumDescriptors = 2;
+	uavHeapDesc.NumDescriptors = 4;
 	uavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	uavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	ThrowIfFailed(m_Device->CreateDescriptorHeap(&uavHeapDesc, IID_PPV_ARGS(&pool.uavHeap)));
@@ -652,7 +679,7 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
 	uavDesc.Format = DXGI_FORMAT_UNKNOWN;
 	uavDesc.Buffer.NumElements = maxParticles;
-	uavDesc.Buffer.StructureByteStride = sizeof(Particle);
+	uavDesc.Buffer.StructureByteStride = sizeof(Particle2D);
 	m_Device->CreateUnorderedAccessView(pool.particleBuffer.Get(), nullptr, &uavDesc, pool.uavHeap->GetCPUDescriptorHandleForHeapStart());
 
 	D3D12_UNORDERED_ACCESS_VIEW_DESC deadListUavDesc = {};
@@ -664,7 +691,63 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE deadListHandle(pool.uavHeap->GetCPUDescriptorHandleForHeapStart(), 1, uavDescSize);
 	m_Device->CreateUnorderedAccessView(pool.deadListBuffer.Get(), pool.deadListBuffer.Get(), &deadListUavDesc, deadListHandle);
 
-	auto spawnBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(1024 * sizeof(Particle));
+	// u2: counted view over aliveListBuffer (AliveList in ParticleCommon.hlsli) -- Append semantics
+	// via IncrementCounter, used by CompactParticles.hlsl, and plain indexed reads by the update shaders.
+	D3D12_UNORDERED_ACCESS_VIEW_DESC aliveListUavDesc = {};
+	aliveListUavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	aliveListUavDesc.Format = DXGI_FORMAT_UNKNOWN;
+	aliveListUavDesc.Buffer.NumElements = maxParticles;
+	aliveListUavDesc.Buffer.StructureByteStride = sizeof(uint32_t);
+	aliveListUavDesc.Buffer.CounterOffsetInBytes = aliveListCounterOffset;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE aliveListHandle(pool.uavHeap->GetCPUDescriptorHandleForHeapStart(), 2, uavDescSize);
+	m_Device->CreateUnorderedAccessView(pool.aliveListBuffer.Get(), pool.aliveListBuffer.Get(), &aliveListUavDesc, aliveListHandle);
+
+	// u3: RAW, uncounted view over the SAME aliveListBuffer resource -- lets AliveCounterRaw.Load
+	// read the counter as a plain uint (ResetAliveCounter.hlsl/BuildDispatchArgs.hlsl/the update
+	// shaders' ResolveAliveIndex) without touching u2's Increment/DecrementCounter semantics.
+	D3D12_UNORDERED_ACCESS_VIEW_DESC aliveListRawDesc = {};
+	aliveListRawDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	aliveListRawDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+	aliveListRawDesc.Buffer.NumElements = (UINT)((aliveListCounterOffset + sizeof(uint32_t)) / sizeof(uint32_t));
+	aliveListRawDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE aliveListRawHandle(pool.uavHeap->GetCPUDescriptorHandleForHeapStart(), 3, uavDescSize);
+	m_Device->CreateUnorderedAccessView(pool.aliveListBuffer.Get(), nullptr, &aliveListRawDesc, aliveListRawHandle);
+
+	// argsBuffer: 3 UINTs (ThreadGroupCountX/Y/Z), read directly by ExecuteIndirect every frame --
+	// written by BuildDispatchArgs.hlsl, never touched by the CPU after creation.
+	D3D12_RESOURCE_DESC argsBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+		3 * sizeof(uint32_t), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+	ThrowIfFailed(m_Device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &argsBufferDesc,
+		D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&pool.argsBuffer)
+	));
+
+	D3D12_DESCRIPTOR_HEAP_DESC argsHeapDesc = {};
+	argsHeapDesc.NumDescriptors = 2;
+	argsHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	argsHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(m_Device->CreateDescriptorHeap(&argsHeapDesc, IID_PPV_ARGS(&pool.argsHeap)));
+	const UINT argsDescSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	// u0: RAW view over the WHOLE aliveListBuffer (data + counter region) -- deliberately NOT the
+	// counted view (that's aliveListUavDesc above, and only one counted view can exist per
+	// resource). BuildDispatchArgs.hlsl only ever Load()s the counter's bytes through this one.
+	D3D12_UNORDERED_ACCESS_VIEW_DESC argsAliveRawDesc = {};
+	argsAliveRawDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	argsAliveRawDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+	argsAliveRawDesc.Buffer.NumElements = (UINT)((aliveListCounterOffset + sizeof(uint32_t)) / sizeof(uint32_t));
+	argsAliveRawDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+	m_Device->CreateUnorderedAccessView(pool.aliveListBuffer.Get(), nullptr, &argsAliveRawDesc, pool.argsHeap->GetCPUDescriptorHandleForHeapStart());
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC argsRawDesc = {};
+	argsRawDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	argsRawDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+	argsRawDesc.Buffer.NumElements = 3;
+	argsRawDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE argsHandle(pool.argsHeap->GetCPUDescriptorHandleForHeapStart(), 1, argsDescSize);
+	m_Device->CreateUnorderedAccessView(pool.argsBuffer.Get(), nullptr, &argsRawDesc, argsHandle);
+
+	auto spawnBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(1024 * sizeof(Particle2D));
 	CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
 	ThrowIfFailed(m_Device->CreateCommittedResource(
 		&uploadHeapProps, D3D12_HEAP_FLAG_NONE, &spawnBufferDesc,
@@ -684,6 +767,11 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 
 	ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
 		SeedParticlePool(m_ParticleEffects[effectID], cmd);
+		// Invalid handle -> flat-colored quads via a 1x1 white texture, so the draw pipeline
+		// always has a real, valid SRV to bind (no separate "untextured" PSO/root-sig variant needed).
+		m_ParticleEffects[effectID].texture = texture.IsValid()
+			? texture
+			: m_Renderer2D->GetResourceManager()->CreateSolidColorTexture(cmd);
 	});
 	m_ParticleEffects[effectID].particleUploadBuffer.Reset();
 	m_ParticleEffects[effectID].deadListUploadBuffer.Reset();
@@ -694,7 +782,11 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateComputeRootSignature() {
 	D3D12_DESCRIPTOR_RANGE uavRange = {};
 	uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-	uavRange.NumDescriptors = 2;
+	// u0=particleBuffer, u1=deadList(counted), u2=aliveList(counted), u3=aliveList(raw) --
+	// see ParticleCommon.hlsli. Shared by every update shader, SpawnParticles.hlsl,
+	// ResetAliveCounter.hlsl, and CompactParticles.hlsl, even though most of them only touch a
+	// subset -- a PSO's shader is allowed to use fewer resources than the root signature declares.
+	uavRange.NumDescriptors = 4;
 	uavRange.BaseShaderRegister = 0;
 
 	D3D12_ROOT_PARAMETER params[3];
@@ -711,7 +803,7 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateComputeRootSigna
 	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[2].Constants.ShaderRegister = 0; // b0
 	params[2].Constants.RegisterSpace = 0;
-	params[2].Constants.Num32BitValues = 3;
+	params[2].Constants.Num32BitValues = 4; // DeltaTime, spawnCount, maxParticles, aliveListCounterOffset
 	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 	D3D12_ROOT_SIGNATURE_DESC desc = { _countof(params), params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
@@ -723,23 +815,78 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateComputeRootSigna
 	return rootSig;
 }
 
-Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateComputePipelineState(const std::wstring& csPath) {
+Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateComputePipelineState(const std::wstring& csPath, ID3D12RootSignature* rootSig) {
 	auto csBlob = ReadFile(ExeRelative(csPath));
 	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
-	psoDesc.pRootSignature = m_ComputeRootSignature.Get();
+	psoDesc.pRootSignature = rootSig ? rootSig : m_ComputeRootSignature.Get();
 	psoDesc.CS = { csBlob.data(), csBlob.size() };
 	ComPtr<ID3D12PipelineState> pso;
 	ThrowIfFailed(m_Device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso)));
 	return pso;
 }
 
+// Descriptor table (2 RAW UAVs: u0 = a pool's aliveListBuffer counter region, u1 = its argsBuffer) +
+// 1 32-bit constant (aliveListCounterOffset) at b0. Deliberately separate from
+// m_ComputeRootSignature -- that one's table binds COUNTED UAVs (particleBuffer/deadList with
+// Append/Consume semantics) which BuildDispatchArgs.hlsl must NOT touch; this one binds plain
+// RAW views instead so reading the counter's bytes can't be confused with Increment/DecrementCounter.
+Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateArgsRootSignature() {
+	D3D12_DESCRIPTOR_RANGE uavRange = {};
+	uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	uavRange.NumDescriptors = 2;
+	uavRange.BaseShaderRegister = 0;
+
+	D3D12_ROOT_PARAMETER params[2];
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[0].DescriptorTable.NumDescriptorRanges = 1;
+	params[0].DescriptorTable.pDescriptorRanges = &uavRange;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[1].Constants.ShaderRegister = 0; // b0
+	params[1].Constants.RegisterSpace = 0;
+	params[1].Constants.Num32BitValues = 1;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_ROOT_SIGNATURE_DESC desc = { _countof(params), params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+	ComPtr<ID3DBlob> signature, error;
+	D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
+
+	ComPtr<ID3D12RootSignature> rootSig;
+	m_Device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&rootSig));
+	return rootSig;
+}
+
 Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateParticleRootSignature() {
-	CD3DX12_ROOT_PARAMETER rootParameters[2];
+	// param2: a 1-SRV descriptor table for this pool's texture (register t1 -- t0 is the raw
+	// root SRV to the particle buffer above). Every pool always has a real texture bound (a
+	// solid-color fallback if none was given -- see RegisterParticleEffect), so there's no
+	// "no texture" variant of this root signature/PSO to maintain.
+	CD3DX12_DESCRIPTOR_RANGE texRange;
+	texRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // 1 SRV, register t1
+
+	// param3: this pool's animation params (atlasFramesX, atlasFramesY, colorEnd) -- register
+	// b1 (b0 is GlobalUniforms, param0). ALL-visibility since the frame/lerp math lives in the
+	// vertex shader but conceivably a future pixel-shader effect might also want it.
+	CD3DX12_ROOT_PARAMETER rootParameters[4];
 	rootParameters[0].InitAsConstantBufferView(0);
 	rootParameters[1].InitAsShaderResourceView(0, 0);
+	rootParameters[2].InitAsDescriptorTable(1, &texRange, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParameters[3].InitAsConstants(6, 1, 0, D3D12_SHADER_VISIBILITY_ALL); // 6 DWORDs: 2 uint + float4
+
+	// Same sampler every pool's texture uses -- no per-pool sampler variation needed yet.
+	D3D12_STATIC_SAMPLER_DESC sampler = {};
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	sampler.ShaderRegister = 0; // register(s0)
+	sampler.RegisterSpace = 0;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
-	rsDesc.Init(_countof(rootParameters), rootParameters, 0, nullptr,
+	rsDesc.Init(_countof(rootParameters), rootParameters, 1, &sampler,
 		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
 	ComPtr<ID3DBlob> signature, error;
@@ -788,7 +935,7 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> RendererCore::CreateParticlePipeline
 }
 
 void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsCommandList* cmd) {
-	std::vector<Particle> initial(pool.maxParticles);
+	std::vector<Particle2D> initial(pool.maxParticles);
 	std::mt19937 rng(12345);
 	std::uniform_real_distribution<float> posX(0.0f, (float)m_ClientWidth);
 	std::uniform_real_distribution<float> posY(0.0f, (float)m_ClientHeight);
@@ -803,7 +950,7 @@ void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsComm
 		p.color = { 1,1,1,1 };
 	}
 
-	const UINT64 bufferSize = (UINT64)pool.maxParticles * sizeof(Particle);
+	const UINT64 bufferSize = (UINT64)pool.maxParticles * sizeof(Particle2D);
 	CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
 	CD3DX12_RESOURCE_DESC uploadDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
 	ThrowIfFailed(m_Device->CreateCommittedResource(
@@ -847,6 +994,17 @@ void RendererCore::SeedParticlePool(ParticleEffectPool& pool, ID3D12GraphicsComm
 	auto deadListToUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.deadListBuffer.Get(),
 		D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	cmd->ResourceBarrier(1, &deadListToUAV);
+
+	// No data to seed for either -- both get fully (re)written every frame (aliveListBuffer by
+	// Reset+Compact, argsBuffer by BuildDispatchArgs) before anything ever reads them. Just get
+	// them out of COMMON so the first frame's UAV writes are legal.
+	auto aliveListToUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.aliveListBuffer.Get(),
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	cmd->ResourceBarrier(1, &aliveListToUAV);
+
+	auto argsToUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.argsBuffer.Get(),
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	cmd->ResourceBarrier(1, &argsToUAV);
 }
 
 // Compute-only: advances every pool's physics/spawn dispatch on the SHARED m_ComputeList. This
@@ -869,19 +1027,72 @@ void RendererCore::UpdateParticles() {
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		m_ComputeList->ResourceBarrier(1, &toUAV);
 
+		float dt = GetLastDeltaTime();
+		UINT computeConstants[4] = { *reinterpret_cast<UINT*>(&dt), spawnCount, pool.maxParticles, (UINT)pool.aliveListCounterOffset };
+
+		// --- Rebuild the compacted alive-index list: Reset the counter, then re-Append every
+		// currently-active particle's index (see ParticleCommon.hlsli / CompactParticles.hlsl).
+		// Must happen every frame BEFORE the update dispatch, since the update dispatch is sized
+		// and indexed entirely off what this pass just wrote.
 		ID3D12DescriptorHeap* computeHeaps[] = { pool.uavHeap.Get() };
 		m_ComputeList->SetDescriptorHeaps(1, computeHeaps);
 		m_ComputeList->SetComputeRootSignature(m_ComputeRootSignature.Get());
-		m_ComputeList->SetPipelineState(pool.updatePSO.Get()); // THIS pool's own behavior shader
 		m_ComputeList->SetComputeRootDescriptorTable(0, pool.uavHeap->GetGPUDescriptorHandleForHeapStart());
 		m_ComputeList->SetComputeRootShaderResourceView(1, pool.spawnBuffer->GetGPUVirtualAddress());
+		m_ComputeList->SetComputeRoot32BitConstants(2, 4, computeConstants, 0);
 
-		float dt = GetLastDeltaTime();
-		UINT computeConstants[3] = { *reinterpret_cast<UINT*>(&dt), spawnCount, pool.maxParticles };
-		m_ComputeList->SetComputeRoot32BitConstants(2, 3, computeConstants, 0);
+		m_ComputeList->SetPipelineState(m_ResetAliveCounterPSO.Get());
+		m_ComputeList->Dispatch(1, 1, 1);
 
-		const UINT groupCount = (pool.maxParticles + 255) / 256;
-		m_ComputeList->Dispatch(groupCount, 1, 1);
+		auto aliveResetBarrier = CD3DX12_RESOURCE_BARRIER::UAV(pool.aliveListBuffer.Get());
+		m_ComputeList->ResourceBarrier(1, &aliveResetBarrier);
+
+		m_ComputeList->SetPipelineState(m_CompactPSO.Get());
+		const UINT compactGroupCount = (pool.maxParticles + 255) / 256;
+		m_ComputeList->Dispatch(compactGroupCount, 1, 1);
+
+		auto aliveCompactBarrier = CD3DX12_RESOURCE_BARRIER::UAV(pool.aliveListBuffer.Get());
+		m_ComputeList->ResourceBarrier(1, &aliveCompactBarrier);
+
+		// --- Build this pool's indirect dispatch args (aliveCount -> ThreadGroupCountX) ---
+		// Entirely GPU-side: reads the alive list's counter (just rebuilt above), writes
+		// {groupCount,1,1} into argsBuffer. Uses the SEPARATE args root sig/heap (RAW UAVs) --
+		// never touches the counted AliveList view the compact/update shaders use.
+		ID3D12DescriptorHeap* argsHeaps[] = { pool.argsHeap.Get() };
+		m_ComputeList->SetDescriptorHeaps(1, argsHeaps);
+		m_ComputeList->SetComputeRootSignature(m_ArgsRootSignature.Get());
+		m_ComputeList->SetPipelineState(m_BuildArgsPSO.Get());
+		m_ComputeList->SetComputeRootDescriptorTable(0, pool.argsHeap->GetGPUDescriptorHandleForHeapStart());
+		UINT argsConstants[1] = { (UINT)pool.aliveListCounterOffset };
+		m_ComputeList->SetComputeRoot32BitConstants(1, 1, argsConstants, 0);
+		m_ComputeList->Dispatch(1, 1, 1);
+
+		// argsBuffer must be INDIRECT_ARGUMENT for ExecuteIndirect to read it, and the write above
+		// must be visible first -- a plain UAV barrier + state transition covers both.
+		D3D12_RESOURCE_BARRIER argsBarriers[2] = {
+			CD3DX12_RESOURCE_BARRIER::UAV(pool.argsBuffer.Get()),
+			CD3DX12_RESOURCE_BARRIER::Transition(pool.argsBuffer.Get(),
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
+		};
+		m_ComputeList->ResourceBarrier(2, argsBarriers);
+
+		// Back to the main compute heap/root sig/bindings (BuildDispatchArgs above switched to
+		// the args heap) -- constants (dt/spawnCount/maxParticles/aliveListCounterOffset) and the
+		// SRV/table bindings are all still exactly what the update dispatch needs, set once above.
+		ID3D12DescriptorHeap* updateHeaps[] = { pool.uavHeap.Get() };
+		m_ComputeList->SetDescriptorHeaps(1, updateHeaps);
+		m_ComputeList->SetComputeRootSignature(m_ComputeRootSignature.Get());
+		m_ComputeList->SetComputeRootDescriptorTable(0, pool.uavHeap->GetGPUDescriptorHandleForHeapStart());
+		m_ComputeList->SetComputeRootShaderResourceView(1, pool.spawnBuffer->GetGPUVirtualAddress());
+		m_ComputeList->SetComputeRoot32BitConstants(2, 4, computeConstants, 0);
+		m_ComputeList->SetPipelineState(pool.updatePSO.Get()); // THIS pool's own behavior shader
+
+		m_ComputeList->ExecuteIndirect(m_DispatchCommandSignature.Get(), 1, pool.argsBuffer.Get(), 0, nullptr, 0);
+
+		// Back to UNORDERED_ACCESS so next frame's BuildDispatchArgs can write it again.
+		auto argsBackToUAV = CD3DX12_RESOURCE_BARRIER::Transition(pool.argsBuffer.Get(),
+			D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		m_ComputeList->ResourceBarrier(1, &argsBackToUAV);
 
 		if (spawnCount > 0) {
 			auto killToSpawnBarrier = CD3DX12_RESOURCE_BARRIER::UAV(pool.particleBuffer.Get());
@@ -914,9 +1125,22 @@ void RendererCore::RecordParticleDraw(ParticleEffectPool& pool, int frame, int b
 	pool.drawAllocators[frame]->Reset();
 	pool.drawList->Reset(pool.drawAllocators[frame].Get(), m_ParticlePSO.Get());
 
+	// pool.texture's gpuHandle lives in Renderer2D's SRV heap (that's where every texture --
+	// sprite art, font atlas, and now particle textures -- gets loaded into), so THAT heap must
+	// be bound here even though this list otherwise has nothing to do with 2D batching.
+	ID3D12DescriptorHeap* srvHeaps[] = { m_Renderer2D->GetSrvHeap() };
+	pool.drawList->SetDescriptorHeaps(1, srvHeaps);
 	pool.drawList->SetGraphicsRootSignature(m_ParticleRootSignature.Get());
 	pool.drawList->SetGraphicsRootConstantBufferView(0, m_ConstantBuffers[frame]->GetGPUVirtualAddress());
 	pool.drawList->SetGraphicsRootShaderResourceView(1, pool.particleBuffer->GetGPUVirtualAddress());
+	pool.drawList->SetGraphicsRootDescriptorTable(2, m_Renderer2D->GetResourceManager()->Resolve(pool.texture).gpuHandle);
+
+	// {atlasFramesX, atlasFramesY, colorEnd.rgba} packed as raw DWORDs -- matches the 6-value
+	// layout declared in CreateParticleRootSignature (param3, register b1).
+	struct { uint32_t framesX, framesY; DirectX::XMFLOAT4 colorEnd; } animConsts = {
+		pool.atlasFramesX, pool.atlasFramesY, pool.colorEnd
+	};
+	pool.drawList->SetGraphicsRoot32BitConstants(3, 6, &animConsts, 0);
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
 		m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
@@ -933,7 +1157,7 @@ void RendererCore::RecordParticleDraw(ParticleEffectPool& pool, int frame, int b
 	ThrowIfFailed(pool.drawList->Close());
 }
 
-void RendererCore::RequestSpawn(uint32_t effectID, Particle p) {
+void RendererCore::RequestSpawn(uint32_t effectID, Particle2D p) {
 	auto& pool = m_ParticleEffects[effectID];
 	if (pool.pendingSpawns.size() < 1024) {
 		pool.pendingSpawns.push_back(p);
@@ -945,7 +1169,7 @@ void RendererCore::RequestSpawn(uint32_t effectID, DirectX::XMFLOAT2 basePositio
 	static std::mt19937 rng(std::random_device{}());
 	std::uniform_real_distribution<float> jitter(-offsetRadius, offsetRadius);
 
-	Particle p{};
+	Particle2D p{};
 	p.position = { basePosition.x + jitter(rng), basePosition.y + jitter(rng) };
 	p.velocity = velocity;
 	p.lifetime = lifetime;
@@ -958,7 +1182,7 @@ void RendererCore::FlushSpawns(ParticleEffectPool& pool) {
 	if (pool.pendingSpawns.empty()) return;
 	void* mapped = nullptr;
 	pool.spawnBuffer->Map(0, nullptr, &mapped);
-	memcpy(mapped, pool.pendingSpawns.data(), pool.pendingSpawns.size() * sizeof(Particle));
+	memcpy(mapped, pool.pendingSpawns.data(), pool.pendingSpawns.size() * sizeof(Particle2D));
 	pool.spawnBuffer->Unmap(0, nullptr);
 	pool.pendingSpawns.clear();
 }

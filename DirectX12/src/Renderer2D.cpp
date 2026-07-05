@@ -1,6 +1,7 @@
 #include "../include/Renderer2D.h"
 #include "../include/Helpers.h"      // ThrowIfFailed
 #include <T_Thread.h>     // T_Thread::GetCurrent()->qIndex for worker-local storage
+#include <TaskScheduler.h> // T_Threads::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h
 #include <cstdio>         // swprintf_s
 
 using namespace Microsoft::WRL;
@@ -11,6 +12,8 @@ static const D3D12_INPUT_ELEMENT_DESC inputLayoutDesc[] = {
 };
 
 ResourceManager* Renderer2D::GetResourceManager() const { return m_ResourceManager.get(); }
+
+
 
 // Call AFTER core.Initialize() -- builds every 2D-specific GPU object against core's
 // already-created device/queue. See the class comment in Renderer.h for the Core/2D split.
@@ -194,52 +197,46 @@ void Renderer2D::CreateInstanceBuffer(ID3D12Device* device, UINT maxInstances) {
 	}
 }
 
-uint64_t Renderer2D::GetMaterialID(Mesh* mesh, TextureResource* tex, uint32_t effectID) {
+uint64_t Renderer2D::GetMaterialID(Mesh* mesh, TextureHandle tex, uint32_t effectID) {
 	// Used as an unordered_map KEY (see Submit/m_MaterialHandles).
-	return ((uint64_t)mesh ^ ((uint64_t)tex << 1)) ^ ((uint64_t)effectID << 48);
+	return ((uint64_t)mesh ^ ((uint64_t)tex.id << 1)) ^ ((uint64_t)effectID << 48);
 }
 
 void Renderer2D::Submit(
-	const Mesh& mesh,
-	TextureResource* tex,
-	DirectX::XMFLOAT2 offset,
-	float width,
-	float height,
-	int zLayer,
-	DirectX::XMFLOAT4 color,
-	float rotation,
-	DirectX::XMFLOAT2 uvOffset,
-	DirectX::XMFLOAT2 uvScale,
-	bool useAlphaFromRGB,
-	uint32_t effectID,
-	DirectX::XMFLOAT4 effectParams)
+	BatchItem& item)
 {
-	DirectX::XMFLOAT2 posNDC = GetNDC(offset.x, offset.y);
+	// Mirroring is just reversing which edge of the UV sub-rect the mesh's 0->1 edge lands on --
+	// negate the scale and shift the offset to the far edge, so the shader's existing
+	// uv = mesh.uv * uvScale + uvOffset (VertexShader.hlsl) needs no changes at all.
+	if (item.flipX) { item.uvOffset.x += item.uvScale.x; item.uvScale.x = -item.uvScale.x; }
+	if (item.flipY) { item.uvOffset.y += item.uvScale.y; item.uvScale.y = -item.uvScale.y; }
+
+	DirectX::XMFLOAT2 posNDC = GetNDC(item.position.x, item.position.y);
 	DirectX::XMFLOAT2 screen = GetScreenSize();
 	DirectX::XMFLOAT2 sizeNDC =
 	{
-		(width / (screen.x / 2.0f)),
-		(height / (screen.y / 2.0f))
+		(item.size.x / (screen.x / 2.0f)),
+		(item.size.y / (screen.y / 2.0f))
 	};
 
 	// Look up (or assign, on first use) this material's bucket HANDLE -- a small sequential
 	// index into m_Buckets[zLayer]. Handles are assigned ONCE and PERSIST across frames
 	// (meshes/textures/effects live for the program's lifetime) -- only per-frame INSTANCE data
 	// gets cleared each frame.
-	uint64_t key = GetMaterialID((Mesh*)&mesh, tex, effectID);
-	auto& handleMap = m_MaterialHandles[zLayer];
+	uint64_t key = GetMaterialID(item.mesh, item.tex, item.effectID);
+	auto& handleMap = m_MaterialHandles[item.zLayer];
 	auto it = handleMap.find(key);
 	uint32_t index;
 	if (it != handleMap.end()) {
 		index = it->second;
 	} else {
-		index = (uint32_t)m_Buckets[zLayer].size();
+		index = (uint32_t)m_Buckets[item.zLayer].size();
 		Batch b;
-		b.mesh = (Mesh*)&mesh;
-		b.tex = tex;
-		b.effectID = effectID;
-		b.depth = (float)zLayer;
-		m_Buckets[zLayer].push_back(b);
+		b.mesh = item.mesh;
+		b.tex = item.tex;
+		b.effectID = item.effectID;
+		b.depth = (float)item.zLayer;
+		m_Buckets[item.zLayer].push_back(b);
 		handleMap[key] = index;
 
 		// Grow EVERY worker's buckets[zLayer] to match, right now -- not just the discovering
@@ -247,7 +244,7 @@ void Renderer2D::Submit(
 		// keeps a SHORTER vector indefinitely.
 		if (m_WorkerLocalStorage) {
 			for (auto& worker : *m_WorkerLocalStorage) {
-				auto& layerBuckets = worker.buckets[zLayer];
+				auto& layerBuckets = worker.buckets[item.zLayer];
 				if (index >= layerBuckets.size()) layerBuckets.resize((size_t)index + 1);
 			}
 		}
@@ -256,14 +253,14 @@ void Renderer2D::Submit(
 	// Push to THIS WORKER'S local bucket, not the shared one. This eliminates concurrent
 	// vector modification races.
 	auto* thread = T_Threads::T_Thread::GetCurrent();
-	float hasTex = (tex != nullptr) ? 1.0f : 0.0f;
-	float alphaFromRGB = useAlphaFromRGB ? 1.0f : 0.0f;
+	float hasTex = item.tex.IsValid() ? 1.0f : 0.0f;
+	float alphaFromRGB = item.useAlphaFromRGB ? 1.0f : 0.0f;
 	size_t workerIdx = (thread && thread->qIndex < MAX_WORKERS) ? (size_t)thread->qIndex : 0;
 	if (m_WorkerLocalStorage) {
-		auto& workerLayerBuckets = (*m_WorkerLocalStorage)[workerIdx].buckets[zLayer];
+		auto& workerLayerBuckets = (*m_WorkerLocalStorage)[workerIdx].buckets[item.zLayer];
 		if (index >= workerLayerBuckets.size()) workerLayerBuckets.resize((size_t)index + 1);
 		workerLayerBuckets[index].push_back(
-			ObjectData(posNDC, sizeNDC, color, hasTex, rotation, uvOffset, uvScale, alphaFromRGB, effectParams)
+			ObjectData(posNDC, sizeNDC, item.color, hasTex, item.rotation, item.uvOffset, item.uvScale, alphaFromRGB, item.effectParams)
 		);
 	}
 }

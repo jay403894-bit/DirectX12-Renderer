@@ -3,7 +3,7 @@
 // buffers this dispatch is currently bound to, so there's only ever one compiled copy of this.
 #include "ParticleCommon.hlsli"
 
-StructuredBuffer<Particle> SpawnBuffer : register(t1);
+StructuredBuffer<Particle2D> SpawnBuffer : register(t1);
 
 // Dispatched with exactly ceil(spawnCount/256) groups from the CPU (see Renderer::UpdateParticles) --
 // unlike the update shaders, thread count here is sized to the number of PENDING SPAWNS, not
