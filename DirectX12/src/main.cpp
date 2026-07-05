@@ -1,13 +1,15 @@
+/*
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <shellapi.h>   // CommandLineToArgvW
 #include <cstdint>
 #include <cwchar>       // wcscmp, wcstol
+#include <TaskDAG.h>
 #include "../include/Window.h"
 #include "../include/Renderer2D.h"
 #include "../include/Helpers.h"
 #include "../include/Font.h"
-#include "../include/TaskDAG.h"
+#include "../include/Camera2D.h"
 //#include "../include/InputManager.h"
 // -w/--width, -h/--height, -warp/--warp. Parsed here (an app concern), then handed
 // to the Window (size) and Renderer (warp adapter).
@@ -110,17 +112,65 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	quadItem.mesh = &quadMesh;
 	float rotation = 0.0f;
 	float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f }; // Define your background
+	float size = 500.0f;
+	bool zoomSwitch = false;
+	Camera2D camera;
+	camera.position = { 1280 / 2,720 / 2 }; // center of the screen
+	struct Object { DirectX::XMFLOAT2 worldPos; BatchItem item; };
+	Object quadA{ { 1280 / 2,720 / 2 } };
+	Object triA{ {200.0f, 200.0f} };
+	Object triB{ {400.0f, 400.0f} };
+	Object triC{ {600.0f, 600.0f} };
+	Object quadB{ {500.0f, 500.0f} };
+	quadItem.position = { 1280 / 2,720 / 2 };
+	quadItem.tex = wood;
+
+	renderer.Submit(quadItem);
+	triangleItem.position = { 200,200 };
+	triangleItem.size = { size, size };
+	triangleItem.zLayer = 1;
+	triangleItem.rotation = rotation;
+	triangleItem.tex = wall;
+	renderer.Submit(triangleItem);
+	triangleItem.position = { 400,400 };
+	renderer.Submit(triangleItem);
+	triangleItem.position = { 600,600 };
+	renderer.Submit(triangleItem);
+	quadItem.position = { 500,500 };
+
+	bool cameraswitch = false;
 
 	while (window.ProcessMessages())
 	{
 		//input.Update();
 		//if (input.IsKeyPressed(VK_SPACE))
 		//	OutputDebugStringA("Space pressed (via InputManager)\n");
-
+		
 		float dt = renderer.GetFrameTime();
 		renderer.UpdateGlobalUniforms(renderer.GetScreenSize());
+		if (size <= 0.0f)
+			zoomSwitch = true;
+		else if (size >= 500.0f)
+			zoomSwitch = false;
+		if (!zoomSwitch)
+			size -= 30.0f * dt;
+		else
+			size += 30.0f * dt;
 		rotation += 30.0f * dt; // 30 degrees per second, now truly framerate-independent
+		static float direction = 1.0f;
 
+		// 2. Apply movement
+		camera.position.x += 30.0f * direction * dt;
+
+		// 3. Boundary check (The "Push" Method)
+		if (camera.position.x >= width) {
+			camera.position.x = width; // Snap to boundary
+			direction = -1.0f;         // Reverse
+		}
+		else if (camera.position.x <= 0) {
+			camera.position.x = 0;     // Snap to boundary
+			direction = 1.0f;          // Reverse
+		}
 		// Per-frame DAG: StartFrame -> {sprites, text} (main-affinity, parallel-in-principle
 		// but both actually run on main, serially, via ProcessMainThread) -> PresentFrame.
 		// EVERY Submit-producer node MUST be added as a dependency of presentNode below, or
@@ -131,24 +181,24 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		auto* startTask = scheduler.CreateTask(RendererCore::StartFrameTask, &core.m_StartFrameCtx,false);
 		auto* startNode = dag.CreateMainNode(startTask);
 
-		auto* spritesTask = scheduler.CreateTask([&renderer, &quadItem, &triangleItem, wood, wall, rotation, linearEffect, waveEffect] {
-			quadItem.position = { 1280 / 2,720 / 2 };
-			quadItem.size = { 100, 100 };
+		auto* spritesTask = scheduler.CreateTask([&renderer, &quadItem, &triangleItem, wood, wall, rotation, linearEffect, waveEffect,size, &camera,width,height] {
+			quadItem.position = camera.WorldToScreen(quadItem.position, {(float)width, (float)height});
+			quadItem.size = { size, size };
 			quadItem.zLayer = 1;
 			quadItem.rotation = rotation;
 			quadItem.tex = wood;
 			renderer.Submit(quadItem);
-			triangleItem.position = { 200,200 };
-			triangleItem.size = { 200, 200 };
+			triangleItem.position = camera.WorldToScreen({ 200,200 }, {(float)width, (float)height});
+			triangleItem.size = { size, size };
 			triangleItem.zLayer = 1;
 			triangleItem.rotation = rotation;
 			triangleItem.tex = wall;
 			renderer.Submit(triangleItem);
-			triangleItem.position = { 400,400 };
+			triangleItem.position = camera.WorldToScreen({ 400,400 }, {(float)width, (float)height});
 			renderer.Submit(triangleItem);
-			triangleItem.position = { 600,600 };
+			triangleItem.position = camera.WorldToScreen({ 600,600 }, {(float)width, (float)height});
 			renderer.Submit(triangleItem);
-			quadItem.position = { 500,500 };
+			quadItem.position = camera.WorldToScreen({ 500,500 }, {(float)width, (float)height});
 			renderer.Submit(quadItem);
 			// effectID, basePosition, offsetRadius (jitter so multiple spawns scatter instead of
 			// stacking), velocity, lifetime, color.
@@ -190,8 +240,14 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		scheduler.WaitForMain(frameWg); // pumps ProcessMainThread; frame N+1 can't start until this returns
 
 	}                               // continuous render loop
-
-//	core.Cleanup();                                       // flush the GPU, close the fence event
+	// MUST be explicit, here, before renderer (Renderer2D) goes out of scope -- local
+	// destruction order is REVERSE of declaration order, so renderer destructs BEFORE core
+	// does. Relying on ~RendererCore() alone means Cleanup()'s GPU-idle Flush() would run
+	// AFTER Renderer2D's command lists/allocators/instance buffer are already released,
+	// letting the GPU still be mid-flight on resources that just got torn out from under it --
+	// that's the shutdown freeze (driver doing extra recovery work), not a coincidence.
+	core.Cleanup();
 	CoUninitialize();
 	return 0;
 }
+*/

@@ -23,9 +23,7 @@ static UINT64 AlignUavCounterOffset(UINT64 dataSizeBytes) {
 RendererCore::RendererCore()
 {}
 RendererCore::~RendererCore()
-{
-	if (m_IsInitialized) Cleanup();
-}
+{}
 // ===========================================================================
 // Public lifecycle
 // ===========================================================================

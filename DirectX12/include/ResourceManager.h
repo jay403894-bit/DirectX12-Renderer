@@ -2,6 +2,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <stdexcept>
 #include <d3d12.h>
 #include <wrl.h>
 #include <d3dx12.h>
@@ -47,7 +48,17 @@ public:
     // Resolves a handle to the real GPU resource data. Only code that actually needs to bind
     // the texture (Renderer2D::FlushBatchTask, RendererCore::RecordParticleDraw) should call
     // this -- everything else should just carry the handle around by value.
-    const TextureResource& Resolve(TextureHandle handle) const { return m_TextureStorage[handle.id]; }
+    const TextureResource& Resolve(TextureHandle handle) const {
+        // An invalid/out-of-range handle used to be a silent out-of-bounds vector read (a
+        // BatchItem submitted before its .tex was ever assigned, e.g.) -- that's exactly the
+        // kind of bug that's easy to submit once and hard to trace back from a raw memory
+        // fault. Fail loudly and immediately instead, with a message naming the actual problem.
+        if (handle.id >= m_TextureStorage.size()) {
+            throw std::runtime_error("ResourceManager::Resolve called with an invalid/unset "
+                "TextureHandle -- did you forget to assign BatchItem::tex before Submit()?");
+        }
+        return m_TextureStorage[handle.id];
+    }
     // Call AFTER the upload command list has been executed and waited on. Frees the
     // temporary upload buffers (they must stay alive until the GPU finishes the copy).
     void ReleaseUploadBuffers() { m_UploadBuffers.clear(); }

@@ -1,5 +1,6 @@
 #pragma once
 #include <GameInput.h>
+#include <DirectXMath.h>
 #include <vector>
 #include <cstdint>
 
@@ -28,11 +29,19 @@ public:
     bool IsKeyPressed(uint8_t virtualKey) const;  // true only on the frame it transitions down
     bool IsKeyReleased(uint8_t virtualKey) const; // true only on the frame it transitions up
 
-    // positionX/Y are relative deltas since the last reading (int64_t in the raw struct) --
-    // cast to float for callers doing simple "mouse look" style accumulation.
-    float GetMouseX() const { return (float)m_MouseState.positionX; }
-    float GetMouseY() const { return (float)m_MouseState.positionY; }
+    // Actual screen-space cursor position (GameInputMouseState::absolutePositionX/Y) -- what
+    // you want for "where is the cursor right now" (UI hit-testing, click position, etc.).
+    DirectX::XMFLOAT2 GetMousePos() const {
+        return { (float)m_MouseState.absolutePositionX, (float)m_MouseState.absolutePositionY };
+    }
+    // Relative delta SINCE THE LAST READING (GameInputMouseState::positionX/Y) -- NOT position.
+    // Good for camera-look style accumulation; use GetMousePos() if you want where the cursor is.
+    float GetMouseDeltaX() const { return (float)m_MouseState.positionX; }
+    float GetMouseDeltaY() const { return (float)m_MouseState.positionY; }
+
     bool IsMouseButtonDown(GameInputMouseButtons button) const;
+    bool IsMouseButtonPressed(GameInputMouseButtons button) const;  // true only on the click frame
+    bool IsMouseButtonReleased(GameInputMouseButtons button) const; // true only on the release frame
 
     bool IsButtonDown(GameInputGamepadButtons button) const;
     bool IsButtonPressed(GameInputGamepadButtons button) const;
@@ -53,6 +62,7 @@ private:
     std::vector<uint8_t> m_PrevKeysDown;
 
     GameInputMouseState m_MouseState = {};
+    GameInputMouseButtons m_PrevMouseButtons = GameInputMouseNone;
     GameInputGamepadState m_GamepadState = {};
     GameInputGamepadButtons m_PrevGamepadButtons = GameInputGamepadNone;
 

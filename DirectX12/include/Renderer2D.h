@@ -161,7 +161,6 @@ private:
 
     CommandContext* m_CurrentContext;
     bool m_IsRenderTargetState = false; // Start as false
-    std::atomic<bool> m_BarrierIssued = false;
     std::vector<CommandContext> m_CommandContextPool;
     // Which zLayers actually had content THIS frame, in ascending order -- filled by
     // FlushBatchParallel, consumed by CollectCommandLists to submit command lists LAYER-MAJOR

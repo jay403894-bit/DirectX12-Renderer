@@ -25,6 +25,7 @@ void InputManager::Update()
     m_PrevKeysDown = m_KeysDown;
     m_KeysDown.clear();
     m_PrevGamepadButtons = m_GamepadState.buttons;
+    m_PrevMouseButtons = m_MouseState.buttons;
 
     // --- Keyboard ---
     IGameInputReading* keyboardReading = nullptr;
@@ -83,6 +84,16 @@ bool InputManager::IsKeyReleased(uint8_t virtualKey) const
 bool InputManager::IsMouseButtonDown(GameInputMouseButtons button) const
 {
     return (m_MouseState.buttons & button) != 0;
+}
+
+bool InputManager::IsMouseButtonPressed(GameInputMouseButtons button) const
+{
+    return (m_MouseState.buttons & button) && !(m_PrevMouseButtons & button);
+}
+
+bool InputManager::IsMouseButtonReleased(GameInputMouseButtons button) const
+{
+    return !(m_MouseState.buttons & button) && (m_PrevMouseButtons & button);
 }
 
 bool InputManager::IsButtonDown(GameInputGamepadButtons button) const
