@@ -36,8 +36,8 @@ static void ParseCommandLine(uint32_t& width, uint32_t& height, bool& useWarp)
 //   Renderer -- owns every GPU object + the render/resize/cleanup logic
 int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
-	JGL::TaskScheduler::Init();
-	JGL::TaskScheduler& scheduler = JGL::TaskScheduler::Instance();
+	JLib::TaskScheduler::Init();
+	JLib::TaskScheduler& scheduler = JLib::TaskScheduler::Instance();
 
 	// 100% client-area scaling, DPI-aware non-client chrome.
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -175,7 +175,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		// but both actually run on main, serially, via ProcessMainThread) -> PresentFrame.
 		// EVERY Submit-producer node MUST be added as a dependency of presentNode below, or
 		// PresentFrame's FlushBatchParallel merge can race with a producer still submitting.
-		JGL::TaskDAG dag(scheduler);
+		JLib::TaskDAG dag(scheduler);
 
 		core.m_StartFrameCtx = { &core, { clearColor[0], clearColor[1], clearColor[2], clearColor[3] } };
 		auto* startTask = scheduler.CreateTask(RendererCore::StartFrameTask, &core.m_StartFrameCtx,false);
@@ -232,7 +232,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		dag.AddDependency(presentNode, textNode);
 		dag.AddDependency(presentNode, particlesNode);
 
-		JGL::WaitGroup frameWg;
+		JLib::WaitGroup frameWg;
 		frameWg.n.store(1, std::memory_order_relaxed); // 1 = the PresentFrame tail node
 		presentTask->waitGroup = &frameWg;             // set BEFORE dag.Submit()
 

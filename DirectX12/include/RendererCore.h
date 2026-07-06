@@ -11,7 +11,7 @@
 #include <vector>
 #include <functional>
 #include "ResourceManager.h" // TextureHandle -- carried by value, needs the full definition
-namespace JGL {
+namespace JLib {
     // One particle, shared GPU-buffer layout across every .hlsl behavior/spawn shader and every
     // particle pool. MUST stay in sync with the Particle struct in UpdateParticles.hlsl,
     // WaveParticles.hlsl, SpawnParticles.hlsl, and ParticleVS.hlsl (via ParticleCommon.hlsli).

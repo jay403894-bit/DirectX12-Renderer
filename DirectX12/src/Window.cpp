@@ -1,6 +1,6 @@
 #include "../include/Window.h"
 #include "../include/RendererCore.h"   // full definition needed here to call m_renderer->Resize()
-using namespace JGL;
+using namespace JLib;
 
 Window::Window(HINSTANCE hInstance, const wchar_t* title, int width, int height)
     : m_hInstance(hInstance) {

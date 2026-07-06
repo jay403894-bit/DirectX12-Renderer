@@ -1,6 +1,6 @@
 #pragma once
 #include <windows.h>
-namespace JGL {
+namespace JLib {
     class RendererCore; // <--- Forward declaration instead of #include -- Resize/VSync live on Core now
     class Window {
     public:

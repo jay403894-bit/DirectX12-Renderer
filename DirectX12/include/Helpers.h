@@ -11,7 +11,7 @@
 #include <fstream>
 #include <cstdio>    
 
-namespace JGL {
+namespace JLib {
     inline void ThrowIfFailed(HRESULT hr)
     {
         if (FAILED(hr))

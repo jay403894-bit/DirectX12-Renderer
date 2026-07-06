@@ -1,7 +1,7 @@
 #pragma once
 #include <DirectXMath.h>
 #include <cstdint>
-namespace JGL {
+namespace JLib {
     // Plain data + Update() -- no ties to Renderer2D at all. Feed the result into the EXISTING
     // Renderer2D::Submit(...)'s uvOffset/uvScale params (Submit already supports arbitrary UV
     // sub-rects), so no new SubmitSprite draw path is needed. Deliberately a flat struct rather

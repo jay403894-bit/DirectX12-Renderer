@@ -1,14 +1,14 @@
 #include "../include/RendererCore.h"
 #include "../include/Renderer2D.h"     // Renderer2D -- PresentFrame collects its draw lists
 #include "../include/Helpers.h"      // ThrowIfFailed
-#include "../include/Event.h"        // JGL::Event (SignalAll) for the fence-wait bridge
+#include "../include/Event.h"        // JLib::Event (SignalAll) for the fence-wait bridge
 #include <Thread.h>
-#include <TaskScheduler.h> // JGL::TaskScheduler::Instance()/WaitOnEventDirectArmed -- previously pulled in transitively via Renderer2D.h
+#include <TaskScheduler.h> // JLib::TaskScheduler::Instance()/WaitOnEventDirectArmed -- previously pulled in transitively via Renderer2D.h
 #include <algorithm>      // std::max
 #include <cassert>
 #include <cstdio>         // swprintf_s
 #include <random>         // RequestSpawn/SeedParticlePool distributions
-using namespace JGL;
+using namespace JLib;
 using namespace Microsoft::WRL;
 
 // D3D12_UNORDERED_ACCESS_VIEW_DESC::Buffer::CounterOffsetInBytes MUST be a multiple of
@@ -436,7 +436,7 @@ namespace {
 	struct FenceWaitCtx {
 		HANDLE      win32Event = nullptr;
 		HANDLE      waitHandle = nullptr;
-		JGL::DirectEvent* evt = nullptr;
+		JLib::DirectEvent* evt = nullptr;
 	};
 	VOID CALLBACK FenceWaitCallback(PVOID param, BOOLEAN /*timedOut*/) {
 		auto* c = static_cast<FenceWaitCtx*>(param);
@@ -452,12 +452,12 @@ void RendererCore::WaitForFenceValue(uint64_t value, std::chrono::milliseconds d
 	if (m_Fence->GetCompletedValue() >= value)
 		return; // already complete -- no wait
 
-	auto& sched = JGL::TaskScheduler::Instance();
+	auto& sched = JLib::TaskScheduler::Instance();
 	if (sched.IsOnFiber()) {
 		// On a fiber: SUSPEND it (freeing the worker to run other jobs) until the GPU
 		// reaches 'value'. Direct/handle event: no name, no eventRegistry, no registryMtx.
 		while (m_Fence->GetCompletedValue() < value) {
-			sched.WaitOnEventDirectArmed([this, value](JGL::DirectEvent* e) {
+			sched.WaitOnEventDirectArmed([this, value](JLib::DirectEvent* e) {
 				auto* c = new FenceWaitCtx();
 				c->evt        = e;
 				c->win32Event = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);

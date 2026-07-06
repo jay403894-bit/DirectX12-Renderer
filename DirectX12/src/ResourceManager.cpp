@@ -4,7 +4,7 @@
 #include <Windows.h>      // WideCharToMultiByte -- narrow keys for AssetManager<T>'s std::string cache
 #include <fstream>        // atlas sidecar parsing (LoadAtlas)
 #include <vector>
-using namespace JGL;
+using namespace JLib;
 
 // "key=value" / "key=\"value\"" line parsing -- shared by LoadAtlas (AtlasPacker's sidecar) and
 // LoadFont (BMFont's .fnt) below, since both are the same plain-text-directive convention.
@@ -42,7 +42,7 @@ void ResourceManager::SetSrvHeap(ID3D12DescriptorHeap* heap) {
     m_SrvHeap = heap; // If m_SrvHeap is a ComPtr, this will AddRef/Release correctly
 }
 TextureHandle ResourceManager::LoadTexture(const std::wstring& filename, ID3D12GraphicsCommandList* cmdList) {
-    JGL::AssetHandle<TextureResource> assetHandle = m_TextureAssets.Load(NarrowKey(filename),
+    JLib::AssetHandle<TextureResource> assetHandle = m_TextureAssets.Load(NarrowKey(filename),
         [&](TextureResource& tex) -> bool {
     // Load the image (WIC needs COM initialized on this thread -- done in wWinMain).
     DirectX::ScratchImage image;
@@ -184,7 +184,7 @@ static bool ParseAtlasRegions(const std::wstring& regionsPath,
     return true;
 }
 
-JGL::AssetHandle<AtlasResource> ResourceManager::LoadAtlas(const std::wstring& regionsPath,
+JLib::AssetHandle<AtlasResource> ResourceManager::LoadAtlas(const std::wstring& regionsPath,
     const std::wstring& atlasImagePath, ID3D12GraphicsCommandList* cmdList) {
     return m_Atlases.Load(NarrowKey(regionsPath), [&](AtlasResource& out) -> bool {
         if (!ParseAtlasRegions(regionsPath, out.regions)) return false;
@@ -194,16 +194,16 @@ JGL::AssetHandle<AtlasResource> ResourceManager::LoadAtlas(const std::wstring& r
         });
 }
 
-JGL::AssetHandle<AtlasResource> ResourceManager::LoadAtlasAsync(const std::wstring& regionsPath,
+JLib::AssetHandle<AtlasResource> ResourceManager::LoadAtlasAsync(const std::wstring& regionsPath,
     const std::wstring& atlasImagePath) {
     std::string key = NarrowKey(regionsPath);
-    JGL::AssetHandle<AtlasResource> existing = m_Atlases.TryGet(key);
+    JLib::AssetHandle<AtlasResource> existing = m_Atlases.TryGet(key);
     if (existing.IsValid()) return existing;
 
     std::unordered_map<std::string, AtlasRegion> regions;
-    if (!ParseAtlasRegions(regionsPath, regions)) return JGL::AssetHandle<AtlasResource>{};
+    if (!ParseAtlasRegions(regionsPath, regions)) return JLib::AssetHandle<AtlasResource>{};
 
-    JGL::AssetHandle<AtlasResource> handle = m_Atlases.Reserve(key);
+    JLib::AssetHandle<AtlasResource> handle = m_Atlases.Reserve(key);
     // Hands the actual image off to the SAME decode-on-worker + PumpAsyncUploads machinery
     // ordinary async textures already use -- no new decode path, just a new completion hookup.
     TextureHandle texHandle = LoadTextureAsync(atlasImagePath);
@@ -213,7 +213,7 @@ JGL::AssetHandle<AtlasResource> ResourceManager::LoadAtlasAsync(const std::wstri
     return handle;
 }
 
-JGL::AssetHandle<FontResource> ResourceManager::LoadFont(const std::wstring& fntPath,
+JLib::AssetHandle<FontResource> ResourceManager::LoadFont(const std::wstring& fntPath,
     const std::wstring& atlasPath, ID3D12GraphicsCommandList* cmdList) {
     return m_Fonts.Load(NarrowKey(fntPath), [&](FontResource& out) -> bool {
         // .fnt is plain text (AngelCode BMFont text format) -- read and parse line by line.
@@ -255,7 +255,7 @@ JGL::AssetHandle<FontResource> ResourceManager::LoadFont(const std::wstring& fnt
 }
 
 TextureHandle ResourceManager::GetTexture(const std::wstring& filename) {
-    JGL::AssetHandle<TextureResource> assetHandle = m_TextureAssets.TryGet(NarrowKey(filename));
+    JLib::AssetHandle<TextureResource> assetHandle = m_TextureAssets.TryGet(NarrowKey(filename));
     return assetHandle.IsValid() ? TextureHandle{ assetHandle.index } : TextureHandle{};
 }
 
@@ -264,18 +264,18 @@ TextureHandle ResourceManager::LoadTextureAsync(const std::wstring& filename) {
 
     // Already reserved/loading/loaded (whether by a prior LoadTextureAsync, or LoadTexture) --
     // don't kick off a duplicate decode for the same file.
-    JGL::AssetHandle<TextureResource> existing = m_TextureAssets.TryGet(key);
+    JLib::AssetHandle<TextureResource> existing = m_TextureAssets.TryGet(key);
     if (existing.IsValid()) {
         return TextureHandle{ existing.index };
     }
 
-    JGL::AssetHandle<TextureResource> textureHandle = m_TextureAssets.Reserve(key);
+    JLib::AssetHandle<TextureResource> textureHandle = m_TextureAssets.Reserve(key);
 
-    // Runs on a JGL::TaskScheduler worker -- decode ONLY, no D3D12 calls (this thread doesn't
+    // Runs on a JLib::TaskScheduler worker -- decode ONLY, no D3D12 calls (this thread doesn't
     // own any frame's command list). Extracts everything the later GPU-upload step needs into
     // plain fields (DecodedImage), rather than keeping the DirectXTex ScratchImage itself, so
     // DirectXTex.h stays confined to this .cpp.
-    JGL::AssetHandle<DecodedImage> decodeHandle = m_DecodedImages.LoadAsync(key,
+    JLib::AssetHandle<DecodedImage> decodeHandle = m_DecodedImages.LoadAsync(key,
         [filename](DecodedImage& img) -> bool {
             DirectX::ScratchImage image;
             if (FAILED(DirectX::LoadFromWICFile(filename.c_str(), DirectX::WIC_FLAGS_NONE, nullptr, image))) {
@@ -308,7 +308,7 @@ void ResourceManager::PumpAsyncUploads(ID3D12GraphicsCommandList* cmdList) {
         std::lock_guard<std::mutex> lock(m_PendingUploadsMutex);
         auto it = m_PendingUploads.begin();
         while (it != m_PendingUploads.end()) {
-            if (m_DecodedImages.GetLoadState(it->decodeHandle) == JGL::AssetManager<DecodedImage>::LoadState::Loading) {
+            if (m_DecodedImages.GetLoadState(it->decodeHandle) == JLib::AssetManager<DecodedImage>::LoadState::Loading) {
                 ++it; // still decoding -- try again next PumpAsyncUploads() call
             }
             else {
@@ -319,8 +319,8 @@ void ResourceManager::PumpAsyncUploads(ID3D12GraphicsCommandList* cmdList) {
     }
 
     for (auto& pending : ready) {
-        JGL::AssetHandle<TextureResource> assetHandle{ pending.textureHandle.id, 0 };
-        if (m_DecodedImages.GetLoadState(pending.decodeHandle) == JGL::AssetManager<DecodedImage>::LoadState::Failed) {
+        JLib::AssetHandle<TextureResource> assetHandle{ pending.textureHandle.id, 0 };
+        if (m_DecodedImages.GetLoadState(pending.decodeHandle) == JLib::AssetManager<DecodedImage>::LoadState::Failed) {
             m_TextureAssets.Complete(assetHandle, TextureResource{}, false);
             continue;
         }
@@ -338,8 +338,8 @@ void ResourceManager::PumpAsyncUploads(ID3D12GraphicsCommandList* cmdList) {
         std::lock_guard<std::mutex> lock(m_PendingAtlasesMutex);
         auto it = m_PendingAtlases.begin();
         while (it != m_PendingAtlases.end()) {
-            auto state = m_TextureAssets.GetLoadState(JGL::AssetHandle<TextureResource>{ it->textureHandle.id, 0 });
-            if (state == JGL::AssetManager<TextureResource>::LoadState::Loading) {
+            auto state = m_TextureAssets.GetLoadState(JLib::AssetHandle<TextureResource>{ it->textureHandle.id, 0 });
+            if (state == JLib::AssetManager<TextureResource>::LoadState::Loading) {
                 ++it; // texture still decoding/uploading -- try again next call
             } else {
                 atlasesReady.push_back(std::move(*it));
@@ -348,8 +348,8 @@ void ResourceManager::PumpAsyncUploads(ID3D12GraphicsCommandList* cmdList) {
         }
     }
     for (auto& pending : atlasesReady) {
-        auto state = m_TextureAssets.GetLoadState(JGL::AssetHandle<TextureResource>{ pending.textureHandle.id, 0 });
-        bool ok = state == JGL::AssetManager<TextureResource>::LoadState::Ready;
+        auto state = m_TextureAssets.GetLoadState(JLib::AssetHandle<TextureResource>{ pending.textureHandle.id, 0 });
+        bool ok = state == JLib::AssetManager<TextureResource>::LoadState::Ready;
         AtlasResource res;
         res.texture = pending.textureHandle;
         res.regions = std::move(pending.regions);
@@ -438,7 +438,7 @@ TextureHandle ResourceManager::CreateSolidColorTexture(ID3D12GraphicsCommandList
     swprintf_s(key, L"__solid_%02x%02x%02x%02x__", r, g, b, a);
     std::string keyStr = NarrowKey(key);
 
-    JGL::AssetHandle<TextureResource> assetHandle = m_TextureAssets.Load(keyStr,
+    JLib::AssetHandle<TextureResource> assetHandle = m_TextureAssets.Load(keyStr,
         [&](TextureResource& tex) -> bool {
     D3D12_RESOURCE_DESC texDesc = {};
     texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

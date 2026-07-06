@@ -2,7 +2,7 @@
 #include <d3d12.h>
 #include <wrl/client.h> 
 #include <cstdint>      
-namespace JGL {
+namespace JLib {
     struct Mesh {
         Microsoft::WRL::ComPtr<ID3D12Resource> vertexBuffer;
         D3D12_VERTEX_BUFFER_VIEW vertexBufferView;

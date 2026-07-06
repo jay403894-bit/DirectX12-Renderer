@@ -1,9 +1,9 @@
 #include "../include/Renderer2D.h"
 #include "../include/Helpers.h"      // ThrowIfFailed
 #include <Thread.h>     // Thread::GetCurrent()->qIndex for worker-local storage
-#include <TaskScheduler.h> // JGL::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h
+#include <TaskScheduler.h> // JLib::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h
 #include <cstdio>         // swprintf_s
-using namespace JGL;
+using namespace JLib;
 using namespace Microsoft::WRL;
 
 static const D3D12_INPUT_ELEMENT_DESC inputLayoutDesc[] = {
@@ -253,7 +253,7 @@ void Renderer2D::Submit(
 
 	// Push to THIS WORKER'S local bucket, not the shared one. This eliminates concurrent
 	// vector modification races.
-	auto* thread = JGL::Thread::GetCurrent();
+	auto* thread = JLib::Thread::GetCurrent();
 	float hasTex = item.tex.IsValid() ? 1.0f : 0.0f;
 	float alphaFromRGB = item.useAlphaFromRGB ? 1.0f : 0.0f;
 	size_t workerIdx = (thread && thread->qIndex < MAX_WORKERS) ? (size_t)thread->qIndex : 0;
@@ -395,8 +395,8 @@ int Renderer2D::FlushBatchParallel() {
 	for (int layer : m_ActiveLayersThisFrame)
 		ProvisionLayerContexts(layer);
 
-	auto& sched = JGL::TaskScheduler::Instance();
-	JGL::WaitGroup wg;
+	auto& sched = JLib::TaskScheduler::Instance();
+	JLib::WaitGroup wg;
 	wg.n.store(0, std::memory_order_relaxed);
 	std::vector<FlushTaskContext*> ctxs;
 	ctxs.reserve((size_t)m_ActiveLayersThisFrame.size() * taskCount);

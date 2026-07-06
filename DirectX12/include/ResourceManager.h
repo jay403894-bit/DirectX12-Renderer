@@ -12,7 +12,7 @@
 #include <AssetManager.h>
 #include "Mesh.h"
 #include "Vertex.h"
-namespace JGL {
+namespace JLib {
     struct TextureResource {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle; // For creating the view
@@ -90,7 +90,7 @@ namespace JGL {
         // list to record the CPU->GPU copy. That missing piece is what broke the renderer.
         TextureHandle LoadTexture(const std::wstring& filename, ID3D12GraphicsCommandList* cmdList);
         // Reserves a TextureHandle immediately (safe to assign to BatchItem::tex/submit right
-        // away) and decodes the file on a JGL::TaskScheduler worker instead of blocking the
+        // away) and decodes the file on a JLib::TaskScheduler worker instead of blocking the
         // calling thread. The GPU upload itself CAN'T run on that worker (it needs a command
         // list belonging to whichever thread is recording the current frame), so it happens
         // later -- call PumpAsyncUploads() once per frame (wherever a command list is available)
@@ -110,8 +110,8 @@ namespace JGL {
         // True once a LoadTextureAsync() (or ordinary LoadTexture()) handle's GPU upload has
         // actually completed and Resolve() is safe to call.
         bool IsTextureReady(TextureHandle handle) const {
-            return m_TextureAssets.GetLoadState(JGL::AssetHandle<TextureResource>{ handle.id, 0 })
-                == JGL::AssetManager<TextureResource>::LoadState::Ready;
+            return m_TextureAssets.GetLoadState(JLib::AssetHandle<TextureResource>{ handle.id, 0 })
+                == JLib::AssetManager<TextureResource>::LoadState::Ready;
         }
         // Invalid handle (IsValid() == false) if filename hasn't been loaded.
         TextureHandle GetTexture(const std::wstring& filename);
@@ -132,7 +132,7 @@ namespace JGL {
             // Generation is always 0 here (see TextureHandle's comment on why that's safe) --
             // AssetManager::Resolve still throws its own clear message for an out-of-range/
             // not-yet-loaded index, same failure philosophy as before this used AssetManager.
-            return m_TextureAssets.Resolve(JGL::AssetHandle<TextureResource>{ handle.id, 0 });
+            return m_TextureAssets.Resolve(JLib::AssetHandle<TextureResource>{ handle.id, 0 });
         }
         // Loads (or returns the cached handle for) an atlas built by the offline AtlasPacker
         // tool -- regionsPath is its sidecar text file, atlasImagePath the packed PNG next to it.
@@ -140,14 +140,14 @@ namespace JGL {
         // itself goes through the ordinary LoadTexture() path (and so is ALSO independently
         // cached/deduplicated by atlasImagePath), so re-using the same atlas image under two
         // different sidecars (unusual, but not prevented) still shares one GPU texture.
-        JGL::AssetHandle<AtlasResource> LoadAtlas(const std::wstring& regionsPath,
+        JLib::AssetHandle<AtlasResource> LoadAtlas(const std::wstring& regionsPath,
             const std::wstring& atlasImagePath, ID3D12GraphicsCommandList* cmdList);
         // Throws if handle is invalid/not-yet-loaded, or if key isn't in the atlas's region map --
         // same "fail loudly" philosophy as every other Resolve() in this file.
-        const AtlasRegion& GetAtlasRegion(JGL::AssetHandle<AtlasResource> handle, const std::string& key) const {
+        const AtlasRegion& GetAtlasRegion(JLib::AssetHandle<AtlasResource> handle, const std::string& key) const {
             return m_Atlases.Resolve(handle).regions.at(key);
         }
-        TextureHandle GetAtlasTexture(JGL::AssetHandle<AtlasResource> handle) const {
+        TextureHandle GetAtlasTexture(JLib::AssetHandle<AtlasResource> handle) const {
             return m_Atlases.Resolve(handle).texture;
         }
         // Async counterpart to LoadAtlas -- returns a handle immediately. The sidecar itself is
@@ -159,17 +159,17 @@ namespace JGL {
         // decode path, just a new completion hookup (see m_PendingAtlases). Check
         // IsAtlasReady(handle) before GetAtlasRegion/GetAtlasTexture/Resolve, same as
         // IsTextureReady() gates a LoadTextureAsync() handle.
-        JGL::AssetHandle<AtlasResource> LoadAtlasAsync(const std::wstring& regionsPath,
+        JLib::AssetHandle<AtlasResource> LoadAtlasAsync(const std::wstring& regionsPath,
             const std::wstring& atlasImagePath);
-        bool IsAtlasReady(JGL::AssetHandle<AtlasResource> handle) const {
-            return m_Atlases.GetLoadState(handle) == JGL::AssetManager<AtlasResource>::LoadState::Ready;
+        bool IsAtlasReady(JLib::AssetHandle<AtlasResource> handle) const {
+            return m_Atlases.GetLoadState(handle) == JLib::AssetManager<AtlasResource>::LoadState::Ready;
         }
         // Loads (or returns the cached handle for) a BMFont .fnt + atlas texture pair, cached by
         // fntPath. Font::Load calls this and caches the returned FontResource's address directly
         // (see Font.h) rather than re-resolving every draw.
-        JGL::AssetHandle<FontResource> LoadFont(const std::wstring& fntPath,
+        JLib::AssetHandle<FontResource> LoadFont(const std::wstring& fntPath,
             const std::wstring& atlasPath, ID3D12GraphicsCommandList* cmdList);
-        const FontResource& ResolveFont(JGL::AssetHandle<FontResource> handle) const {
+        const FontResource& ResolveFont(JLib::AssetHandle<FontResource> handle) const {
             return m_Fonts.Resolve(handle);
         }
         // Call AFTER the upload command list has been executed and waited on. Frees the
@@ -184,7 +184,7 @@ namespace JGL {
         int meshCtr = 0;
         ID3D12Device* m_Device;
         ID3D12DescriptorHeap* m_SrvHeap; // Just a pointer, not a ComPtr
-        // Backed by the shared JGL::AssetManager<T> (see AssetManager.h) instead of a hand-rolled
+        // Backed by the shared JLib::AssetManager<T> (see AssetManager.h) instead of a hand-rolled
         // vector+unordered_map -- same underlying idea (index-based, append-only, key-cached
         // storage) but the bookkeeping (and, if ever needed, async loading via
         // AssetManager::LoadAsync) is now shared with Sound's asset loading instead of duplicated.
@@ -194,27 +194,27 @@ namespace JGL {
         // the slot's real generation never advances past 0, making that reconstruction always
         // valid. If per-texture unloading is ever added, TextureHandle needs its own generation
         // field too -- reconstructing {id, 0} would then silently validate against a REUSED slot.
-        JGL::AssetManager<TextureResource> m_TextureAssets;
+        JLib::AssetManager<TextureResource> m_TextureAssets;
         // CPU-side decode cache for LoadTextureAsync() -- separate from m_TextureAssets because
         // decoding (any thread) and GPU upload (must be the frame-recording thread) are two
         // different steps with two different threading constraints. Never Unload()'d, same as
         // m_TextureAssets.
-        JGL::AssetManager<DecodedImage> m_DecodedImages;
+        JLib::AssetManager<DecodedImage> m_DecodedImages;
         // Atlases built by the offline AtlasPacker tool -- see AtlasResource's comment. Never
         // Unload()'d, same as m_TextureAssets/m_DecodedImages.
-        JGL::AssetManager<AtlasResource> m_Atlases;
+        JLib::AssetManager<AtlasResource> m_Atlases;
         // Fonts loaded via LoadFont -- see FontResource's comment. Never Unload()'d: Font.h
         // caches a raw pointer into this manager's slot storage for the lifetime of the Font
         // object, which is only safe because a slot's address never changes and is never
         // invalidated/reused (see AssetManager<T>::m_Slots' comment) as long as Unload() is never
         // called on it.
-        JGL::AssetManager<FontResource> m_Fonts;
+        JLib::AssetManager<FontResource> m_Fonts;
         // One entry per LoadTextureAsync() call whose GPU upload hasn't been finished by
         // PumpAsyncUploads() yet. Guarded by its own mutex -- LoadTextureAsync() can be called
         // from any thread, PumpAsyncUploads() runs on whichever thread owns the frame's cmdList.
         struct PendingUpload {
             TextureHandle textureHandle;
-            JGL::AssetHandle<DecodedImage> decodeHandle;
+            JLib::AssetHandle<DecodedImage> decodeHandle;
         };
         std::mutex m_PendingUploadsMutex;
         std::vector<PendingUpload> m_PendingUploads;
@@ -224,7 +224,7 @@ namespace JGL {
         // in one shot, same "nothing partially visible before Ready" contract LoadTextureAsync's
         // own DecodedImage/TextureResource split already uses.
         struct PendingAtlas {
-            JGL::AssetHandle<AtlasResource> atlasHandle;
+            JLib::AssetHandle<AtlasResource> atlasHandle;
             TextureHandle textureHandle;
             std::unordered_map<std::string, AtlasRegion> regions;
         };

@@ -2,7 +2,7 @@
 #include "../include/Renderer2D.h"
 #include "../include/Helpers.h"
 #include <sstream>
-using namespace JGL;
+using namespace JLib;
 
 void Font::Load(const std::wstring& fntPath, const std::wstring& atlasPath, Renderer2D& renderer) {
     ResourceManager* rm = renderer.GetResourceManager();

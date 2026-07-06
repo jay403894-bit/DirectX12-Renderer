@@ -4,7 +4,7 @@
 #include "Mesh.h"
 #include "ResourceManager.h"
 
-namespace JGL {
+namespace JLib {
     class Renderer2D;
 
     enum class TextAlign {
@@ -36,7 +36,7 @@ namespace JGL {
 
         float Kerning(int first, int second) const;
 
-        JGL::AssetHandle<FontResource> m_Handle;
+        JLib::AssetHandle<FontResource> m_Handle;
         const FontResource* m_Font = nullptr;
         Mesh unitQuad{};
     };

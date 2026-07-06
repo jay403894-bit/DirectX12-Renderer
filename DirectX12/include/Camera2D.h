@@ -1,6 +1,6 @@
 #pragma once
 #include <DirectXMath.h>
-namespace JGL {
+namespace JLib {
     // Plain data + two conversion functions -- deliberately NOT part of Renderer2D/RendererCore.
     // Renderer2D's Submit() already converts screen-space -> NDC per object on the CPU
     // (RendererCore::GetNDC), so a camera fits as an EXTRA transform the caller applies to world

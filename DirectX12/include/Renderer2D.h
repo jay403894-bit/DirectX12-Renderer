@@ -18,7 +18,7 @@
 #include "Font.h"
 #include "RendererCore.h"
 #define NUM_LAYERS 10
-namespace JGL {
+namespace JLib {
     struct BatchItem {
         // Pointer to an externally-owned, STABLE Mesh -- NOT a value copy. Submit() caches
         // &item.mesh's pointee in a Batch that persists across every future frame (see

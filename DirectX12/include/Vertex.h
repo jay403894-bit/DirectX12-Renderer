@@ -1,5 +1,5 @@
 #pragma once
-namespace JGL {
+namespace JLib {
     struct Vertex {
         float x, y, z;    // Position
         float r, g, b, a; // Color
