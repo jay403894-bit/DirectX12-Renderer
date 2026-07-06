@@ -1,22 +1,41 @@
-// Same GlobalUniforms layout as VertexShader.hlsl -- screenSize is the only field this needs
-// (pixel-space particle positions -> NDC), kept identical so both shaders can share the SAME
-// constant buffer (m_ConstantBuffers[frame]) without a second upload.
+// Same GlobalUniforms layout as VertexShader.hlsl, kept identical so both shaders can share the
+// SAME constant buffer (m_ConstantBuffers[frame]) without a second upload. cameraPos/cameraZoom
+// are what this shader actually needs them for (see VSMain): particles are simulated entirely in
+// WORLD space on the GPU (UpdateParticles.hlsl/WaveParticles.hlsl just do position += velocity*dt,
+// which doesn't care what space it's in), and nothing on the CPU ever reprojects a live
+// particle's position through the camera the way Renderer2D::Submit does for sprites -- this is
+// the one place camera-awareness has to live for particles.
 cbuffer GlobalUniforms : register(b0)
 {
     float time;
-    float3 padding1;
+    float2 cameraPos;
+    float padding1;
     float2 screenSize;
     float aspectRatio;
-    float padding4;
+    float cameraZoom;
 };
 
-// Packed per-pool via RendererCore::RecordParticleDraw's SetGraphicsRoot32BitConstants(3, 6, ...) --
+// Packed per-pool via RendererCore::RecordParticleDraw's SetGraphicsRoot32BitConstants(3, 8, ...) --
 // atlasFramesX/Y describe a flipbook grid on the bound texture (1x1 = no animation, just a static
 // sprite), colorEnd is the color/alpha this pool's particles lerp toward over their lifetime.
+// screenSpace (see RendererCore::ParticleEffectPool::screenSpace): 0 = normal, world-space
+// particles that scroll/rescale with the camera (the common case). 1 = this pool's
+// Particle2D::position is ALREADY in screen pixels -- VSMain skips the camera transform
+// entirely, for effects that decorate the view itself (lens grime, damage vignette, menu
+// background) rather than existing at a location in the scene.
+// screenSpace/_pad0 are placed BEFORE colorEnd, not after: HLSL cbuffers pack into 16-byte
+// registers and never let a member straddle a register boundary. atlasFramesX+atlasFramesY only
+// fill 8 of the first register's 16 bytes, so a float4 placed right after them would get silently
+// padded to the NEXT register by the compiler -- while the C++-side struct packs everything
+// tightly with no such gap, so the two layouts silently disagree on where screenSpace lives.
+// Filling the first register's remaining 8 bytes with screenSpace/_pad0 keeps every offset
+// exactly matching the plain C++ struct with no compiler-inserted padding on either side.
 cbuffer AnimParams : register(b1)
 {
     uint atlasFramesX;
     uint atlasFramesY;
+    uint screenSpace;
+    uint _pad0;
     float4 colorEnd;
 };
 
@@ -65,12 +84,19 @@ VSOutput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     VSOutput output;
     Particle2D p = ParticleBuffer[instanceID];
 
-    float2 corner = kCornerOffsets[vertexID] * p.size;
-    float2 worldPos = p.position + corner;
+    // screenSpace pools (see AnimParams comment above) skip the camera transform entirely --
+    // p.position is already in screen pixels for those, same as the old pre-camera behavior.
+    // Otherwise p.position/p.size are WORLD-space: offset by cameraPos, scale by cameraZoom (so
+    // particles get visibly bigger/smaller as you zoom, not just further apart -- matches a real
+    // camera, unlike Renderer2D's current sprite path, which only offsets position).
+    float2 localPos = p.position + kCornerOffsets[vertexID] * p.size;
+    float2 screenPos = screenSpace != 0
+        ? localPos
+        : (localPos - cameraPos) * cameraZoom + screenSize * 0.5f;
 
     float2 ndc;
-    ndc.x = (worldPos.x / screenSize.x) * 2.0f - 1.0f;
-    ndc.y = 1.0f - (worldPos.y / screenSize.y) * 2.0f;
+    ndc.x = (screenPos.x / screenSize.x) * 2.0f - 1.0f;
+    ndc.y = 1.0f - (screenPos.y / screenSize.y) * 2.0f;
 
     output.pos = float4(ndc, 0.0f, 1.0f);
 

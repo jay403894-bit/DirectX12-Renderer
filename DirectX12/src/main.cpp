@@ -36,8 +36,8 @@ static void ParseCommandLine(uint32_t& width, uint32_t& height, bool& useWarp)
 //   Renderer -- owns every GPU object + the render/resize/cleanup logic
 int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
-	T_Threads::TaskScheduler::Init();
-	T_Threads::TaskScheduler& scheduler = T_Threads::TaskScheduler::Instance();
+	JGL::TaskScheduler::Init();
+	JGL::TaskScheduler& scheduler = JGL::TaskScheduler::Instance();
 
 	// 100% client-area scaling, DPI-aware non-client chrome.
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -69,8 +69,8 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	// (sin-driven wave) -- and its own particle pool, so they can never step on each other's slots.
 	// zLayer=1 here: draws over anything at zLayer 0 (e.g. background tiles) and under zLayer 2+
 	// (e.g. the FPS/text overlay) -- see RendererCore::PresentFrame's layer-interleaving comment.
-	uint32_t linearEffect = core.RegisterParticleEffect(L"UpdateParticles.cso", 256000, 1);
-	uint32_t waveEffect = core.RegisterParticleEffect(L"WaveParticles.cso", 50000, 1);
+	uint32_t linearEffect = core.RegisterParticleEffect(L"shaders\\UpdateParticles.cso", 256000, 1);
+	uint32_t waveEffect = core.RegisterParticleEffect(L"shaders\\WaveParticles.cso", 50000, 1);
 	//InputManager input;
 	//input.Initialize(); // real window (window.GetHandle()) exists now -- GameInput needs a focusable HWND
 	window.Show();
@@ -93,14 +93,14 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 	auto cmdList = renderer.GetCommandList();
 	TextureHandle wall;
 	renderer.ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
-		wall = resourceManager->LoadTexture(ExeRelative(L"wall.png"), cmd);
+		wall = resourceManager->LoadTexture(ExeRelative(L"textures\\wall.png"), cmd);
 		});
 	TextureHandle wood;
 	renderer.ExecuteUploadCommand([&](ID3D12GraphicsCommandList* cmd) {
-		wood = resourceManager->LoadTexture(ExeRelative(L"wood.png"), cmd);
+		wood = resourceManager->LoadTexture(ExeRelative(L"textures\\wood.png"), cmd);
 		});
 	Font font;
-	font.Load(ExeRelative(L"font.fnt"), ExeRelative(L"font.png"), renderer);
+	font.Load(ExeRelative(L"fonts\\Aldrich-Regular.fnt"), ExeRelative(L"fonts\\Aldrich-Regular.png"), renderer);
 	// Meshes MUST be their own persistent variables, not stored by value inside a SpriteBatchItem --
 	// Submit() caches a pointer to whatever Mesh an item points at, permanently, across every
 	// future frame (see SpriteBatchItem::mesh's comment), so the Mesh needs to outlive the item.
@@ -147,7 +147,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		//	OutputDebugStringA("Space pressed (via InputManager)\n");
 		
 		float dt = renderer.GetFrameTime();
-		renderer.UpdateGlobalUniforms(renderer.GetScreenSize());
+		renderer.UpdateGlobalUniforms(renderer.GetScreenSize(), camera.position, camera.zoom);
 		if (size <= 0.0f)
 			zoomSwitch = true;
 		else if (size >= 500.0f)
@@ -175,7 +175,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		// but both actually run on main, serially, via ProcessMainThread) -> PresentFrame.
 		// EVERY Submit-producer node MUST be added as a dependency of presentNode below, or
 		// PresentFrame's FlushBatchParallel merge can race with a producer still submitting.
-		T_Threads::TaskDAG dag(scheduler);
+		JGL::TaskDAG dag(scheduler);
 
 		core.m_StartFrameCtx = { &core, { clearColor[0], clearColor[1], clearColor[2], clearColor[3] } };
 		auto* startTask = scheduler.CreateTask(RendererCore::StartFrameTask, &core.m_StartFrameCtx,false);
@@ -232,7 +232,7 @@ int CALLBACK wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 		dag.AddDependency(presentNode, textNode);
 		dag.AddDependency(presentNode, particlesNode);
 
-		T_Threads::WaitGroup frameWg;
+		JGL::WaitGroup frameWg;
 		frameWg.n.store(1, std::memory_order_relaxed); // 1 = the PresentFrame tail node
 		presentTask->waitGroup = &frameWg;             // set BEFORE dag.Submit()
 

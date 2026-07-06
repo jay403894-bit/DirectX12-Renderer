@@ -4,4 +4,5 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="DirectX12/DirectX12.vcxproj" Id="6ef8b916-dba1-42d9-ad6b-726405bd30ce" />
+  <Project Path="AtlasPacker/AtlasPacker.vcxproj" Id="9a2f5b3a-6b6d-4c9e-9d3a-6e6f1d5c2b7a" />
 </Solution>

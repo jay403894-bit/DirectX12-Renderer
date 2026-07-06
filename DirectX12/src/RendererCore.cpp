@@ -1,14 +1,14 @@
 #include "../include/RendererCore.h"
 #include "../include/Renderer2D.h"     // Renderer2D -- PresentFrame collects its draw lists
 #include "../include/Helpers.h"      // ThrowIfFailed
-#include "../include/Event.h"        // T_Threads::Event (SignalAll) for the fence-wait bridge
-#include <T_Thread.h>
-#include <TaskScheduler.h> // T_Threads::TaskScheduler::Instance()/WaitOnEventDirectArmed -- previously pulled in transitively via Renderer2D.h
+#include "../include/Event.h"        // JGL::Event (SignalAll) for the fence-wait bridge
+#include <Thread.h>
+#include <TaskScheduler.h> // JGL::TaskScheduler::Instance()/WaitOnEventDirectArmed -- previously pulled in transitively via Renderer2D.h
 #include <algorithm>      // std::max
 #include <cassert>
 #include <cstdio>         // swprintf_s
 #include <random>         // RequestSpawn/SeedParticlePool distributions
-
+using namespace JGL;
 using namespace Microsoft::WRL;
 
 // D3D12_UNORDERED_ACCESS_VIEW_DESC::Buffer::CounterOffsetInBytes MUST be a multiple of
@@ -436,7 +436,7 @@ namespace {
 	struct FenceWaitCtx {
 		HANDLE      win32Event = nullptr;
 		HANDLE      waitHandle = nullptr;
-		T_Threads::DirectEvent* evt = nullptr;
+		JGL::DirectEvent* evt = nullptr;
 	};
 	VOID CALLBACK FenceWaitCallback(PVOID param, BOOLEAN /*timedOut*/) {
 		auto* c = static_cast<FenceWaitCtx*>(param);
@@ -452,12 +452,12 @@ void RendererCore::WaitForFenceValue(uint64_t value, std::chrono::milliseconds d
 	if (m_Fence->GetCompletedValue() >= value)
 		return; // already complete -- no wait
 
-	auto& sched = T_Threads::TaskScheduler::Instance();
+	auto& sched = JGL::TaskScheduler::Instance();
 	if (sched.IsOnFiber()) {
 		// On a fiber: SUSPEND it (freeing the worker to run other jobs) until the GPU
 		// reaches 'value'. Direct/handle event: no name, no eventRegistry, no registryMtx.
 		while (m_Fence->GetCompletedValue() < value) {
-			sched.WaitOnEventDirectArmed([this, value](T_Threads::DirectEvent* e) {
+			sched.WaitOnEventDirectArmed([this, value](JGL::DirectEvent* e) {
 				auto* c = new FenceWaitCtx();
 				c->evt        = e;
 				c->win32Event = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -580,13 +580,15 @@ void RendererCore::ExecuteUploadCommand(std::function<void(ID3D12GraphicsCommand
 	Flush(); // Wait for GPU to finish the upload
 }
 
-void RendererCore::UpdateGlobalUniforms(DirectX::XMFLOAT2 screenSize) {
+void RendererCore::UpdateGlobalUniforms(DirectX::XMFLOAT2 screenSize, DirectX::XMFLOAT2 cameraPos, float cameraZoom) {
 	float ar = screenSize.x / (screenSize.y > 0.0f ? screenSize.y : 1.0f);
 	// Sync-rotation slot (m_FrameResourceIndex), not the swap-chain back-buffer index -- this
 	// constant buffer is a CPU/GPU-sync resource, unrelated to which back buffer is on screen.
 	ConstantBufferData* pData = reinterpret_cast<ConstantBufferData*>(m_MappedConstantBufferData[m_FrameResourceIndex]);
 	pData->screenSize = screenSize;
 	pData->aspectRatio = ar;
+	pData->cameraPos = cameraPos;
+	pData->cameraZoom = cameraZoom;
 }
 
 DirectX::XMFLOAT2 RendererCore::GetScreenSize() const {
@@ -606,14 +608,14 @@ DirectX::XMFLOAT2 RendererCore::GetNDC(float targetX, float targetY)
 // ===========================================================================
 void RendererCore::InitializeParticleSystem() {
 	m_ComputeRootSignature = CreateComputeRootSignature();
-	m_SpawnPSO = CreateComputePipelineState(L"SpawnParticles.cso"); // shared -- popping a dead slot is identical regardless of pool
-	m_ResetAliveCounterPSO = CreateComputePipelineState(L"ResetAliveCounter.cso"); // shared
-	m_CompactPSO = CreateComputePipelineState(L"CompactParticles.cso"); // shared
+	m_SpawnPSO = CreateComputePipelineState(L"shaders\\SpawnParticles.cso"); // shared -- popping a dead slot is identical regardless of pool
+	m_ResetAliveCounterPSO = CreateComputePipelineState(L"shaders\\ResetAliveCounter.cso"); // shared
+	m_CompactPSO = CreateComputePipelineState(L"shaders\\CompactParticles.cso"); // shared
 	m_ParticleRootSignature = CreateParticleRootSignature();
-	m_ParticlePSO = CreateParticlePipelineState(L"ParticleVS.cso", L"ParticlePS.cso"); // shared draw shader for now
+	m_ParticlePSO = CreateParticlePipelineState(L"shaders\\ParticleVS.cso", L"shaders\\ParticlePS.cso"); // shared draw shader for now
 
 	m_ArgsRootSignature = CreateArgsRootSignature();
-	m_BuildArgsPSO = CreateComputePipelineState(L"BuildDispatchArgs.cso", m_ArgsRootSignature.Get());
+	m_BuildArgsPSO = CreateComputePipelineState(L"shaders\\BuildDispatchArgs.cso", m_ArgsRootSignature.Get());
 
 	D3D12_INDIRECT_ARGUMENT_DESC dispatchArg = {};
 	dispatchArg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
@@ -627,7 +629,7 @@ void RendererCore::InitializeParticleSystem() {
 	ThrowIfFailed(m_Device->CreateCommandSignature(&cmdSigDesc, nullptr, IID_PPV_ARGS(&m_DispatchCommandSignature)));
 }
 
-uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, int zLayer,
+uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, bool screenSpace, int zLayer, 
 	TextureHandle texture, uint32_t atlasFramesX, uint32_t atlasFramesY, DirectX::XMFLOAT4 colorEnd) {
 	ParticleEffectPool pool;
 	pool.maxParticles = maxParticles;
@@ -635,6 +637,7 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 	pool.atlasFramesX = atlasFramesX;
 	pool.atlasFramesY = atlasFramesY;
 	pool.colorEnd = colorEnd;
+	pool.screenSpace = screenSpace;
 
 	D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
@@ -870,7 +873,7 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateParticleRootSign
 	rootParameters[0].InitAsConstantBufferView(0);
 	rootParameters[1].InitAsShaderResourceView(0, 0);
 	rootParameters[2].InitAsDescriptorTable(1, &texRange, D3D12_SHADER_VISIBILITY_PIXEL);
-	rootParameters[3].InitAsConstants(6, 1, 0, D3D12_SHADER_VISIBILITY_ALL); // 6 DWORDs: 2 uint + float4
+	rootParameters[3].InitAsConstants(8, 1, 0, D3D12_SHADER_VISIBILITY_ALL); // 8 DWORDs: 2 uint + screenSpace + pad + float4
 
 	// Same sampler every pool's texture uses -- no per-pool sampler variation needed yet.
 	D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -1133,12 +1136,13 @@ void RendererCore::RecordParticleDraw(ParticleEffectPool& pool, int frame, int b
 	pool.drawList->SetGraphicsRootShaderResourceView(1, pool.particleBuffer->GetGPUVirtualAddress());
 	pool.drawList->SetGraphicsRootDescriptorTable(2, m_Renderer2D->GetResourceManager()->Resolve(pool.texture).gpuHandle);
 
-	// {atlasFramesX, atlasFramesY, colorEnd.rgba} packed as raw DWORDs -- matches the 6-value
-	// layout declared in CreateParticleRootSignature (param3, register b1).
-	struct { uint32_t framesX, framesY; DirectX::XMFLOAT4 colorEnd; } animConsts = {
-		pool.atlasFramesX, pool.atlasFramesY, pool.colorEnd
+	// {atlasFramesX, atlasFramesY, screenSpace, pad, colorEnd.rgba} packed as raw DWORDs -- MUST
+	// match ParticleVS.hlsl's AnimParams field order exactly (screenSpace/_pad0 before colorEnd,
+	// not after -- see that cbuffer's comment on HLSL's 16-byte register packing rules).
+	struct { uint32_t framesX, framesY, screenSpace, pad0; DirectX::XMFLOAT4 colorEnd; } animConsts = {
+		pool.atlasFramesX, pool.atlasFramesY, pool.screenSpace ? 1u : 0u, 0, pool.colorEnd
 	};
-	pool.drawList->SetGraphicsRoot32BitConstants(3, 6, &animConsts, 0);
+	pool.drawList->SetGraphicsRoot32BitConstants(3, 8, &animConsts, 0);
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
 		m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);

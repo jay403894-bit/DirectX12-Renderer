@@ -1,10 +1,11 @@
 #include "../include/Renderer2D.h"
 #include "../include/Helpers.h"      // ThrowIfFailed
-#include <T_Thread.h>     // T_Thread::GetCurrent()->qIndex for worker-local storage
-#include <TaskScheduler.h> // T_Threads::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h
+#include <Thread.h>     // Thread::GetCurrent()->qIndex for worker-local storage
+#include <TaskScheduler.h> // JGL::TaskScheduler::Instance()/CreateTask -- previously pulled in transitively via Renderer2D.h
 #include <cstdio>         // swprintf_s
-
+using namespace JGL;
 using namespace Microsoft::WRL;
+
 static const D3D12_INPUT_ELEMENT_DESC inputLayoutDesc[] = {
 	{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -25,7 +26,7 @@ void Renderer2D::Initialize(RendererCore& core)
 	m_RootSignature = CreateRootSignature();
 	// effectID 0: the default sprite/text shader. Registered here so Submit()'s default
 	// effectID=0 and FlushBatchTask's m_Effects[b.effectID] lookup both resolve correctly.
-	m_PipelineState = CreatePipelineState(L"VertexShader.cso", L"PixelShader.cso", DefaultAlphaBlend());
+	m_PipelineState = CreatePipelineState(L"shaders\\VertexShader.cso", L"shaders\\PixelShader.cso", DefaultAlphaBlend());
 	m_Effects.push_back({ m_PipelineState });
 	CreateInstanceBuffer(device, 65536);  // 64K instances max per frame
 	// Allocate per-worker submission buffers (heap-allocated to avoid stack overflow)
@@ -63,7 +64,7 @@ void Renderer2D::Initialize(RendererCore& core)
 	// Renderer2D's own built-in Font (used by UpdateFPS()'s SubmitText convenience wrapper).
 	// MUST come after m_ResourceManager exists and core's command queue/list are ready (true
 	// by the time core.Initialize() returns, which is a precondition of calling this function).
-	font.Load(ExeRelative(L"font.fnt"), ExeRelative(L"font.png"), *this);
+	font.Load(ExeRelative(L"fonts\\Aldrich-Regular.fnt"), ExeRelative(L"fonts\\Aldrich-Regular.png"), *this);
 }
 
 ComPtr<ID3D12RootSignature> Renderer2D::CreateRootSignature() {
@@ -252,7 +253,7 @@ void Renderer2D::Submit(
 
 	// Push to THIS WORKER'S local bucket, not the shared one. This eliminates concurrent
 	// vector modification races.
-	auto* thread = T_Threads::T_Thread::GetCurrent();
+	auto* thread = JGL::Thread::GetCurrent();
 	float hasTex = item.tex.IsValid() ? 1.0f : 0.0f;
 	float alphaFromRGB = item.useAlphaFromRGB ? 1.0f : 0.0f;
 	size_t workerIdx = (thread && thread->qIndex < MAX_WORKERS) ? (size_t)thread->qIndex : 0;
@@ -394,8 +395,8 @@ int Renderer2D::FlushBatchParallel() {
 	for (int layer : m_ActiveLayersThisFrame)
 		ProvisionLayerContexts(layer);
 
-	auto& sched = T_Threads::TaskScheduler::Instance();
-	T_Threads::WaitGroup wg;
+	auto& sched = JGL::TaskScheduler::Instance();
+	JGL::WaitGroup wg;
 	wg.n.store(0, std::memory_order_relaxed);
 	std::vector<FlushTaskContext*> ctxs;
 	ctxs.reserve((size_t)m_ActiveLayersThisFrame.size() * taskCount);

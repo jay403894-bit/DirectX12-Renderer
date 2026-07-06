@@ -2,10 +2,14 @@
 cbuffer GlobalUniforms : register(b0)
 {
     float time;
-    float3 padding1;
+    float2 cameraPos;   // world-space point the camera is centered on (unused by sprites --
+                         // Renderer2D::Submit already reprojects through Camera2D on the CPU
+                         // before this shader ever runs; kept here only for layout parity with
+                         // ParticleVS.hlsl, which shares this exact cbuffer).
+    float padding1;
     float2 screenSize;
     float aspectRatio;
-    float padding4;
+    float cameraZoom;
 };
 
 // Replace cbuffer ObjectData with a StructuredBuffer
