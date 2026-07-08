@@ -227,12 +227,15 @@ namespace JLib {
         // signature, rasterizer/depth state, RTV format) stays fixed across effects.
         Microsoft::WRL::ComPtr<ID3D12PipelineState> CreatePipelineState(
             const std::wstring& vsPath, const std::wstring& psPath, D3D12_BLEND_DESC blend);
-        static D3D12_BLEND_DESC DefaultAlphaBlend(); // standard alpha "over" blend, used by effectID 0
         void CreateInstanceBuffer(ID3D12Device* device, UINT maxInstances);
         uint64_t GetMaterialID(Mesh* mesh, TextureHandle tex, uint32_t effectID);
         void ProvisionLayerContexts(int layer);
 
     public:
+        // Standard alpha "over" blend -- used by effectID 0, and reusable by any RegisterEffect()
+        // caller that just wants normal transparency (e.g. an outline effect with a transparent
+        // interior) without hand-rolling the same D3D12_BLEND_DESC fields themselves.
+        static D3D12_BLEND_DESC DefaultAlphaBlend();
         // Call AFTER core.Initialize() -- builds root signature/PSO/instance buffer/worker storage/
         // SRV heap/resource manager/font against core's already-created device/queue.
         void Initialize(RendererCore& core);

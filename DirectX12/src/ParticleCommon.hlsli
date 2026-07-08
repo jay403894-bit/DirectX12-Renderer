@@ -38,13 +38,17 @@ RWByteAddressBuffer AliveCounterRaw : register(u3);
 // value now (not a shader constant) so one compiled update shader works correctly no matter
 // which pool's buffers it's currently bound to. aliveListCounterOffset is u2/u3's hidden
 // counter's byte offset within that resource (AlignUavCounterOffset-rounded, differs per pool
-// since it depends on maxParticles) -- needed by AliveCounterRaw.Load below.
+// since it depends on maxParticles) -- needed by AliveCounterRaw.Load below. GravityScale is a
+// per-POOL px/s^2 constant (RendererCore::RegisterParticleEffect, default 0 = no gravity) --
+// not baked into UpdateParticles.hlsl directly, since not every effect using that shader wants
+// to fall (e.g. a screen-space overlay effect).
 cbuffer TimeCB : register(b0)
 {
     float DeltaTime;
     uint spawnCount;
     uint maxParticles;
     uint aliveListCounterOffset;
+    float GravityScale;
 };
 
 // Common prologue for update shaders (NOT SpawnParticles.hlsl, which still scans by raw

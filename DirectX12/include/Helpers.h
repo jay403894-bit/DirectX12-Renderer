@@ -35,6 +35,19 @@ namespace JLib {
         if (slash != std::wstring::npos) dir.resize(slash + 1);
         return dir + filename;
     }
+    // Narrow-string sibling of ExeRelative -- same reasoning (cwd != exe dir when debugging from
+    // VS), but for APIs that take const char* instead of const wchar_t* (e.g.
+    // SoundManager::PlaySound/PlayLoop, which hand the path straight to miniaudio's ma_decoder,
+    // a narrow-string API). "sound\\name.mp3" (no leading slash -- that would make it look
+    // absolute/rooted and defeat the whole point) in, "<exeDir>\\sound\\name.mp3" out.
+    inline std::string ExeRelativeA(const std::string& filename) {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string dir(path, n);
+        size_t slash = dir.find_last_of("\\/");
+        if (slash != std::string::npos) dir.resize(slash + 1);
+        return dir + filename;
+    }
 
     inline std::vector<char> ReadFile(const std::wstring& filename) {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);

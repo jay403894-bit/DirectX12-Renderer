@@ -2,7 +2,7 @@
 #include "../include/RendererCore.h"   // full definition needed here to call m_renderer->Resize()
 using namespace JLib;
 
-Window::Window(HINSTANCE hInstance, const wchar_t* title, int width, int height)
+Window::Window(HINSTANCE hInstance, const wchar_t* title, int width, int height, bool resizable)
     : m_hInstance(hInstance) {
 
     const wchar_t* className = L"DX12WindowClass";
@@ -10,8 +10,46 @@ Window::Window(HINSTANCE hInstance, const wchar_t* title, int width, int height)
                        NULL, LoadCursor(NULL, IDC_ARROW), (HBRUSH)(COLOR_WINDOW + 1), NULL, className, NULL };
     RegisterClassExW(&wc);
 
-    m_hWnd = CreateWindowExW(NULL, className, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        width, height, NULL, NULL, hInstance, this); // PASS 'this' HERE
+    // Dropping WS_THICKFRAME/WS_MAXIMIZEBOX isn't just "no drag-resize" -- it also removes
+    // Windows' system-enforced minimum resizable-window width/height (SM_CXMIN/SM_CYMIN). A
+    // RESIZABLE window gets silently clamped to that minimum by CreateWindowExW/SetWindowPos
+    // alike, no matter what size is requested -- observed firsthand sizing a small fixed-layout
+    // window (a 300px-wide Tetris board): asking for an outer width well under the minimum still
+    // produced a much wider client area, and shrinking it back down via SetWindowPos afterward
+    // had NO effect at all, both consistent with a hard floor rather than a DPI rounding error.
+    m_baseStyle = resizable ? WS_OVERLAPPEDWINDOW
+                            : (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+
+    // CreateWindowExW's width/height are the OUTER window rect (title bar + borders included),
+    // not the client area -- without this adjustment, the actual drawable area ends up smaller
+    // than requested by the non-client chrome (title bar ~31-39px, thin borders). Usually
+    // invisible on a large window, but anything sizing content to exactly fill the window (e.g.
+    // a game board sized cellSize*rows == requested height) will visibly come up short.
+    RECT rect = { 0, 0, width, height };
+    AdjustWindowRect(&rect, m_baseStyle, FALSE);
+    int outerWidth = rect.right - rect.left;
+    int outerHeight = rect.bottom - rect.top;
+
+    m_hWnd = CreateWindowExW(NULL, className, title, m_baseStyle, CW_USEDEFAULT, CW_USEDEFAULT,
+        outerWidth, outerHeight, NULL, NULL, hInstance, this); // PASS 'this' HERE
+
+    // AdjustWindowRect's border-size math comes from SYSTEM DPI, not this specific window's
+    // actual per-monitor DPI (the app is per-monitor-DPI-aware -- see main.cpp's
+    // SetThreadDpiAwarenessContext call) -- on a non-100%-scaled display those can disagree by a
+    // few pixels, so the client area we actually got can still miss the target. Measure it and,
+    // if it's off, grow/shrink the OUTER rect by the exact delta and resize once more. This
+    // converges in one correction pass since the chrome size itself doesn't change between calls
+    // (a NON-resizable window has no minimum-size floor to fight, so this always converges here).
+    RECT actualClient{};
+    GetClientRect(m_hWnd, &actualClient);
+    int actualWidth = actualClient.right - actualClient.left;
+    int actualHeight = actualClient.bottom - actualClient.top;
+    if (actualWidth != width || actualHeight != height) {
+        int correctedOuterWidth = outerWidth + (width - actualWidth);
+        int correctedOuterHeight = outerHeight + (height - actualHeight);
+        SetWindowPos(m_hWnd, nullptr, 0, 0, correctedOuterWidth, correctedOuterHeight,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 Window::~Window() {
@@ -97,8 +135,10 @@ void Window::SetFullscreen(bool fullscreen) {
         ShowWindow(m_hWnd, SW_MAXIMIZE);
     }
     else {
-        // Restore window decorations + the saved windowed rect.
-        SetWindowLong(m_hWnd, GWL_STYLE, WS_OVERLAPPEDWINDOW);
+        // Restore window decorations + the saved windowed rect -- m_baseStyle, NOT a hardcoded
+        // WS_OVERLAPPEDWINDOW, so a non-resizable window (see the constructor) comes back
+        // non-resizable instead of gaining a thick frame/maximize box it never had.
+        SetWindowLong(m_hWnd, GWL_STYLE, m_baseStyle);
         SetWindowPos(m_hWnd, HWND_NOTOPMOST,
             m_windowRect.left, m_windowRect.top,
             m_windowRect.right - m_windowRect.left,

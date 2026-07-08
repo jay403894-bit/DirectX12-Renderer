@@ -75,15 +75,17 @@ void RendererCore::Initialize(HWND hWnd, uint32_t width, uint32_t height, bool u
 	// Per-effect pools (particle/dead-list/spawn buffers, each pool's OWN update shader) are NOT
 	// created here -- call RegisterParticleEffect() after both Initialize() calls return.
 	InitializeParticleSystem();
+	m_ComputeQueue = CreateCommandQueue(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+	m_ComputeQueue->SetName(L"ComputeQueue (particles)");
 	for (int i = 0; i < NumFrames; ++i)
-		m_ComputeAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT);
-	m_ComputeList = CreateCommandList(m_ComputeAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_DIRECT);
+		m_ComputeAllocators[i] = CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+	m_ComputeList = CreateCommandList(m_ComputeAllocators[m_FrameResourceIndex], D3D12_COMMAND_LIST_TYPE_COMPUTE);
 	m_ComputeList->SetName(L"Compute (particle update)");
 
 	m_IsInitialized = true;
 }
 
-void RendererCore::BeginFrame(const float clearColor[4]) {
+void RendererCore::BeginFrame(const DirectX::XMFLOAT4& clearColor) {
 	// TWO DIFFERENT indices, deliberately -- see m_FrameResourceIndex's declaration comment.
 	// frame: which rotating sync-slot (allocators, instance buffer) to reclaim/reuse.
 	// backBuffer: which actual swap-chain back buffer to transition/clear/render into.
@@ -115,7 +117,7 @@ void RendererCore::BeginFrame(const float clearColor[4]) {
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(
 		m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
-	m_CommandList->ClearRenderTargetView(rtv, (FLOAT*)clearColor, 0, nullptr);
+	m_CommandList->ClearRenderTargetView(rtv, reinterpret_cast<const FLOAT*>(&clearColor), 0, nullptr);
 
 	m_CommandList->Close(); // PRE complete; submitted first in PresentFrame
 }
@@ -138,15 +140,30 @@ void RendererCore::PresentFrame() {
 	m_PostList->ResourceBarrier(1, &toPresent);
 	m_PostList->Close();
 
-	// Execute PRE + all physics dispatches + [particle draws / 2D layers interleaved by
-	// zLayer] + POST. Physics dispatches never touch the render target, so they always run as
-	// one block right after PRE, before ANY draw. From there, particle pools and Renderer2D's
-	// sprite/text layers are submitted together in ascending zLayer order -- particles before
-	// sprites within the same layer -- so a pool registered at zLayer 2 actually draws over
-	// whatever's at zLayer 0/1 and under zLayer 3, instead of always sitting under everything.
+	// Every pool's physics/spawn dispatch now runs on its OWN async-compute queue, independent
+	// of m_CommandQueue's PRE/draw/POST submission below -- lets it overlap with graphics work
+	// on hardware with a real async compute engine instead of always serializing on one queue.
+	// Before touching particleBuffer this frame, wait for LAST frame's graphics submission (which
+	// read it as an SRV in the particle draw) to finish -- otherwise this dispatch's UAV writes
+	// can race that still-in-flight read on the other queue, since a ResourceBarrier only orders
+	// work within a single queue's own command stream and can't protect against a different queue.
+	if (m_LastGraphicsSignalValue != 0)
+		ThrowIfFailed(m_ComputeQueue->Wait(m_Fence.Get(), m_LastGraphicsSignalValue));
+	ID3D12CommandList* computeLists[] = { m_ComputeList.Get() };
+	m_ComputeQueue->ExecuteCommandLists(1, computeLists);
+	uint64_t computeSignalValue = SignalCompute();
+	// The particle draws below read particleBuffer as an SRV (ParticleVS.hlsl), so the graphics
+	// queue must not start them before this dispatch's UAV writes finish -- a GPU-side Wait() on
+	// the fence value this signals handles that without a CPU stall.
+	ThrowIfFailed(m_CommandQueue->Wait(m_Fence.Get(), computeSignalValue));
+
+	// Execute PRE + [particle draws / 2D layers interleaved by zLayer] + POST. Particle pools and
+	// Renderer2D's sprite/text layers are submitted together in ascending zLayer order --
+	// particles before sprites within the same layer -- so a pool registered at zLayer 2 actually
+	// draws over whatever's at zLayer 0/1 and under zLayer 3, instead of always sitting under
+	// everything.
 	std::vector<ID3D12CommandList*> allLists;
 	allLists.push_back(m_CommandList.Get());  // PRE: clear + PRESENT->RENDER_TARGET
-	allLists.push_back(m_ComputeList.Get());  // every pool's physics/spawn dispatch (see UpdateParticles)
 	for (int layer = 0; layer < NUM_LAYERS; ++layer) {
 		for (auto& pool : m_ParticleEffects)
 			if (pool.zLayer == layer) allLists.push_back(pool.drawList.Get());
@@ -157,7 +174,14 @@ void RendererCore::PresentFrame() {
 
 	// Present, then ONE fence scheme (m_FrameFenceValues + Signal()). BeginFrame waits on
 	// m_FrameFenceValues[frame] before reusing this slot's allocators next time around.
-	HRESULT hrPresent = m_SwapChain->Present(m_VSync ? 1 : 0, 0);
+	// ALLOW_TEARING is only legal (DXGI validates this) when SyncInterval is 0, i.e. VSync off --
+	// the swap chain was already created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING gated on
+	// m_TearingSupported, but that alone doesn't make Present() actually tear; this flag is the
+	// per-present opt-in. Without it, VSync off didn't behave like VSync off (no visible tearing,
+	// still effectively capped) -- this also matters beyond raw tearing: Windows requires this
+	// flag for G-Sync/FreeSync variable refresh rate to work correctly in windowed/borderless mode.
+	UINT presentFlags = (!m_VSync && m_TearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+	HRESULT hrPresent = m_SwapChain->Present(m_VSync ? 1 : 0, presentFlags);
 	if (FAILED(hrPresent)) {
 		// A TDR surfaces here as DEVICE_REMOVED/RESET. Dump DRED (which op/resource killed
 		// the GPU) BEFORE throwing, so we get the diagnosis instead of a bare crash.
@@ -166,6 +190,7 @@ void RendererCore::PresentFrame() {
 		ThrowIfFailed(hrPresent);
 	}
 	m_FrameFenceValues[frame] = Signal();
+	m_LastGraphicsSignalValue = m_FrameFenceValues[frame]; // next frame's compute dispatch waits on this
 	m_CurrentBackBufferIndex = m_SwapChain->GetCurrentBackBufferIndex(); // DXGI-controlled, for the NEXT frame's back buffer
 	m_FrameResourceIndex = (m_FrameResourceIndex + 1) % NumFrames;     // app-controlled, fully independent rotation
 
@@ -428,6 +453,16 @@ uint64_t RendererCore::Signal()
 	return valueForSignal;
 }
 
+uint64_t RendererCore::SignalCompute()
+{
+	// Same m_Fence, same monotonic m_FenceValue counter as Signal() -- a fence may legally be
+	// signaled from multiple queues as long as every signaled value strictly increases, which
+	// sharing the counter guarantees regardless of which queue calls this.
+	uint64_t valueForSignal = ++m_FenceValue;
+	ThrowIfFailed(m_ComputeQueue->Signal(m_Fence.Get(), valueForSignal));
+	return valueForSignal;
+}
+
 namespace {
 	// Carries the per-wait state for the GPU-fence -> fiber bridge. One Win32 event per wait
 	// (not a shared one) so overlapping waits can't stomp each other. The DirectEvent* is the
@@ -629,8 +664,8 @@ void RendererCore::InitializeParticleSystem() {
 	ThrowIfFailed(m_Device->CreateCommandSignature(&cmdSigDesc, nullptr, IID_PPV_ARGS(&m_DispatchCommandSignature)));
 }
 
-uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, bool screenSpace, int zLayer, 
-	TextureHandle texture, uint32_t atlasFramesX, uint32_t atlasFramesY, DirectX::XMFLOAT4 colorEnd) {
+uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, bool screenSpace, int zLayer,
+	TextureHandle texture, uint32_t atlasFramesX, uint32_t atlasFramesY, DirectX::XMFLOAT4 colorEnd, float gravityScale) {
 	ParticleEffectPool pool;
 	pool.maxParticles = maxParticles;
 	pool.zLayer = zLayer;
@@ -638,6 +673,7 @@ uint32_t RendererCore::RegisterParticleEffect(const std::wstring& updateCsPath, 
 	pool.atlasFramesY = atlasFramesY;
 	pool.colorEnd = colorEnd;
 	pool.screenSpace = screenSpace;
+	pool.gravityScale = gravityScale;
 
 	D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
@@ -804,7 +840,7 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> RendererCore::CreateComputeRootSigna
 	params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 	params[2].Constants.ShaderRegister = 0; // b0
 	params[2].Constants.RegisterSpace = 0;
-	params[2].Constants.Num32BitValues = 4; // DeltaTime, spawnCount, maxParticles, aliveListCounterOffset
+	params[2].Constants.Num32BitValues = 5; // DeltaTime, spawnCount, maxParticles, aliveListCounterOffset, GravityScale
 	params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 	D3D12_ROOT_SIGNATURE_DESC desc = { _countof(params), params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
@@ -1029,7 +1065,8 @@ void RendererCore::UpdateParticles() {
 		m_ComputeList->ResourceBarrier(1, &toUAV);
 
 		float dt = GetLastDeltaTime();
-		UINT computeConstants[4] = { *reinterpret_cast<UINT*>(&dt), spawnCount, pool.maxParticles, (UINT)pool.aliveListCounterOffset };
+		UINT computeConstants[5] = { *reinterpret_cast<UINT*>(&dt), spawnCount, pool.maxParticles,
+			(UINT)pool.aliveListCounterOffset, *reinterpret_cast<UINT*>(&pool.gravityScale) };
 
 		// --- Rebuild the compacted alive-index list: Reset the counter, then re-Append every
 		// currently-active particle's index (see ParticleCommon.hlsli / CompactParticles.hlsl).
@@ -1040,7 +1077,7 @@ void RendererCore::UpdateParticles() {
 		m_ComputeList->SetComputeRootSignature(m_ComputeRootSignature.Get());
 		m_ComputeList->SetComputeRootDescriptorTable(0, pool.uavHeap->GetGPUDescriptorHandleForHeapStart());
 		m_ComputeList->SetComputeRootShaderResourceView(1, pool.spawnBuffer->GetGPUVirtualAddress());
-		m_ComputeList->SetComputeRoot32BitConstants(2, 4, computeConstants, 0);
+		m_ComputeList->SetComputeRoot32BitConstants(2, 5, computeConstants, 0);
 
 		m_ComputeList->SetPipelineState(m_ResetAliveCounterPSO.Get());
 		m_ComputeList->Dispatch(1, 1, 1);
@@ -1085,7 +1122,7 @@ void RendererCore::UpdateParticles() {
 		m_ComputeList->SetComputeRootSignature(m_ComputeRootSignature.Get());
 		m_ComputeList->SetComputeRootDescriptorTable(0, pool.uavHeap->GetGPUDescriptorHandleForHeapStart());
 		m_ComputeList->SetComputeRootShaderResourceView(1, pool.spawnBuffer->GetGPUVirtualAddress());
-		m_ComputeList->SetComputeRoot32BitConstants(2, 4, computeConstants, 0);
+		m_ComputeList->SetComputeRoot32BitConstants(2, 5, computeConstants, 0);
 		m_ComputeList->SetPipelineState(pool.updatePSO.Get()); // THIS pool's own behavior shader
 
 		m_ComputeList->ExecuteIndirect(m_DispatchCommandSignature.Get(), 1, pool.argsBuffer.Get(), 0, nullptr, 0);

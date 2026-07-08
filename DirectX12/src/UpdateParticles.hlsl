@@ -9,6 +9,7 @@ void main(uint3 DTid : SV_DispatchThreadID)
     uint i;
     if (!ResolveAliveIndex(DTid.x, i)) return;
 
+    ParticleBuffer[i].velocity.y += GravityScale * DeltaTime;
     ParticleBuffer[i].position += ParticleBuffer[i].velocity * DeltaTime;
     ParticleBuffer[i].lifetime -= DeltaTime;
     ParticleBuffer[i].age += DeltaTime;

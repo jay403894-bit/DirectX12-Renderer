@@ -59,7 +59,7 @@ namespace JLib {
         // be a data race on the context fields.
         struct StartFrameContext {
             RendererCore* core;
-            float clearColor[4];
+            DirectX::XMFLOAT4 clearColor;
         };
         struct PresentFrameContext {
             RendererCore* core;
@@ -117,7 +117,7 @@ namespace JLib {
         void SetRenderer2D(Renderer2D* renderer2D) { m_Renderer2D = renderer2D; }
 
         void Initialize(HWND hWnd, uint32_t width, uint32_t height, bool useWarp = false);
-        void BeginFrame(const float clearColor[4]);
+        void BeginFrame(const DirectX::XMFLOAT4& clearColor);
         void PresentFrame();
         void Resize(uint32_t width, uint32_t height);
         void Cleanup();
@@ -193,7 +193,7 @@ namespace JLib {
         // RequestSpawn.
         uint32_t RegisterParticleEffect(const std::wstring& updateCsPath, uint32_t maxParticles, bool screenSpace = false, int zLayer = 0,
             TextureHandle texture = {}, uint32_t atlasFramesX = 1, uint32_t atlasFramesY = 1,
-            DirectX::XMFLOAT4 colorEnd = { 1.0f, 1.0f, 1.0f, 0.0f });
+            DirectX::XMFLOAT4 colorEnd = { 1.0f, 1.0f, 1.0f, 0.0f }, float gravityScale = 0.0f);
         // effectID comes from RegisterParticleEffect() -- routes the spawn to that pool's own
         // spawn buffer/dead list, so different behaviors never share particle slots.
         void RequestSpawn(uint32_t effectID, Particle2D p);
@@ -248,6 +248,10 @@ namespace JLib {
             // pixels -- for effects decorating the VIEW itself rather than the world (a lens-grime
             // overlay, a damage vignette, a menu background) so they never scroll/rescale away.
             bool screenSpace = false;
+            // px/s^2 applied to velocity.y every update-shader tick, 0 (default) = no gravity.
+            // Per-pool rather than baked into UpdateParticles.hlsl, since not every effect using
+            // that shader wants to fall (e.g. a screen-space overlay effect).
+            float gravityScale = 0.0f;
             Microsoft::WRL::ComPtr<ID3D12Resource> particleBuffer;
             Microsoft::WRL::ComPtr<ID3D12Resource> deadListBuffer;
             Microsoft::WRL::ComPtr<ID3D12Resource> spawnBuffer;
@@ -299,6 +303,10 @@ namespace JLib {
         void   LogDeviceRemoved();          // dumps DRED breadcrumbs + page fault on device-removed
         void CreateConstantBuffers();
         uint64_t Signal();
+        // Same scheme as Signal(), but signals m_Fence from m_ComputeQueue instead of
+        // m_CommandQueue -- lets the graphics queue Wait() on this value (GPU-side, no CPU
+        // stall) before reading anything the compute dispatch wrote, without a full Flush().
+        uint64_t SignalCompute();
         void     WaitForFenceValue(uint64_t value, std::chrono::milliseconds dur = std::chrono::milliseconds::max());
         void     Flush();   // Signal + wait: GPU idle, safe to release/resize resources
 
@@ -361,6 +369,11 @@ namespace JLib {
         // Core devices
         Microsoft::WRL::ComPtr<ID3D12Device2>      m_Device;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_CommandQueue;
+        // Async-compute queue -- ONLY the particle update/spawn dispatch (m_ComputeList) submits
+        // here now, separate from m_CommandQueue's PRE/draw/POST submission in PresentFrame. On
+        // hardware with a real async compute engine this lets particle sim overlap with the
+        // previous frame's graphics work instead of serializing behind it on one queue.
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_ComputeQueue;
         Microsoft::WRL::ComPtr<IDXGISwapChain4>    m_SwapChain;
 
         // Per-frame data (the triple-buffer set)
@@ -392,6 +405,12 @@ namespace JLib {
         Microsoft::WRL::ComPtr<ID3D12Fence> m_Fence;
         uint64_t m_FenceValue = 0;
         HANDLE   m_FenceEvent = nullptr;
+        // Value the GRAPHICS queue signaled at the end of the last PresentFrame -- the compute
+        // queue must Wait() on this before touching particleBuffer again, otherwise its UAV
+        // writes can race the previous frame's still-in-flight SRV read (ParticleVS.hlsl) on a
+        // different queue, which no ResourceBarrier (single-queue-only) can order. 0 == no prior
+        // graphics submission yet (first frame), so the initial compute dispatch doesn't wait.
+        uint64_t m_LastGraphicsSignalValue = 0;
         // Constant buffers (one per frame)
         Microsoft::WRL::ComPtr<ID3D12Resource> m_ConstantBuffers[NumFrames];
         // You also need to keep the pointer to the "mapped" memory so you can write to it every
