@@ -76,7 +76,13 @@ ComPtr<ID3D12RootSignature> Renderer2D::CreateRootSignature() {
 	rootParameters[2].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
 	D3D12_STATIC_SAMPLER_DESC sampler = {};
-	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	// POINT, not LINEAR -- bilinear filtering blends across texel boundaries, which for a densely-
+	// packed pixel-art atlas (no padding between cells) bleeds neighboring tiles' edge pixels into
+	// whatever's sampled right at a UV rect boundary -- the thin stray lines seen over enemies/
+	// platforms once real sprite sheets were in use. Point sampling never blends between texels
+	// regardless of exact UV precision, which is also just the correct look for pixel art in general
+	// (LINEAR would blur every sprite, not only cause seams).
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
 	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;	sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <vector>
 #include <functional>
+#include <GetTime.h> // JLib::Time -- QueryPerformanceCounter-backed clock, shared with GetFrameTime()
 #include "ResourceManager.h" // TextureHandle -- carried by value, needs the full definition
 namespace JLib {
     // One particle, shared GPU-buffer layout across every .hlsl behavior/spawn shader and every
@@ -160,14 +161,22 @@ namespace JLib {
         // frame"). First call ever returns 0 (no prior timepoint to diff against) instead of some
         // huge bogus value measured from process startup.
         float GetFrameTime() {
-            auto now = std::chrono::high_resolution_clock::now();
+            // JLib::Time (QueryPerformanceCounter-backed), not std::chrono::high_resolution_clock --
+            // gives every consumer of "current time" in the app (this, and anything else that later
+            // calls JLib::Time::GetTime() directly) the same clock instead of two independently-
+            // ticking ones. Time::Initialize() is called lazily here, on the first-ever GetFrameTime()
+            // call -- RendererCore is only ever constructed once per process, so this is the one
+            // legitimate place to seed the epoch; calling Time::Initialize() again from anywhere else
+            // would reset that shared epoch out from under every other consumer.
             if (m_FirstFrameTimeCall) {
-                m_LastFrameTime = now;
+                JLib::Time::Initialize();
+                m_LastFrameTime = JLib::Time::GetTime();
                 m_FirstFrameTimeCall = false;
                 m_LastDeltaTime = 0.0f;
                 return 0.0f;
             }
-            float dt = std::chrono::duration<float>(now - m_LastFrameTime).count();
+            double now = JLib::Time::GetTime();
+            float dt = static_cast<float>(now - m_LastFrameTime);
             m_LastFrameTime = now;
             m_LastDeltaTime = dt;
             return dt;
@@ -425,7 +434,7 @@ namespace JLib {
         bool m_UseWarp = false;
         bool m_IsInitialized = false;
 
-        std::chrono::high_resolution_clock::time_point m_LastFrameTime;
+        double m_LastFrameTime = 0.0;
         bool m_FirstFrameTimeCall = true;
         float m_LastDeltaTime = 0.0f;
     };

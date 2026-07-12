@@ -9,12 +9,25 @@ using namespace JLib;
 // "key=value" / "key=\"value\"" line parsing -- shared by LoadAtlas (AtlasPacker's sidecar) and
 // LoadFont (BMFont's .fnt) below, since both are the same plain-text-directive convention.
 static float FindField(const std::string& line, const char* key) {
-    size_t pos = line.find(key);
-    if (pos == std::string::npos) return 0.0f;
-    pos += strlen(key);
-    if (pos >= line.size() || line[pos] != '=') return 0.0f;
-    ++pos;
-    return static_cast<float>(atof(line.c_str() + pos));
+    // Bare line.find(key) used to grab the FIRST substring match anywhere in the line and give up
+    // immediately if it wasn't followed by '=' -- which breaks the moment a region/font NAME
+    // happens to contain the same letter as a single-character key. E.g. region name="mystery"
+    // x=0 y=102 ...: line.find("y") matches the 'y' inside "mystery" (not followed by '='), so
+    // FindField(line, "y") returned 0 instead of ever reaching the real "y=102" later in the line
+    // -- the mystery ship's parsed region silently became {x=0,y=0,...}, exactly overlapping a
+    // DIFFERENT region ("alien_3") that legitimately starts at 0,0. Now: keep scanning forward
+    // past any match that isn't a real "key=" token (preceded by start-of-line or whitespace),
+    // instead of stopping at the first substring hit anywhere in the line.
+    std::string keyEq = std::string(key) + "=";
+    size_t searchStart = 0;
+    while (true) {
+        size_t pos = line.find(keyEq, searchStart);
+        if (pos == std::string::npos) return 0.0f;
+        if (pos == 0 || line[pos - 1] == ' ') {
+            return static_cast<float>(atof(line.c_str() + pos + keyEq.size()));
+        }
+        searchStart = pos + 1;
+    }
 }
 static std::string FindNameField(const std::string& line) {
     size_t pos = line.find("name=\"");

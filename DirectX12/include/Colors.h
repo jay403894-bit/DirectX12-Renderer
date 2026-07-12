@@ -1,5 +1,6 @@
 #pragma once
 #include <DirectXMath.h>
+#include <cstdlib>
 namespace JLib {
     // Ported from raylib's Color palette (raylib.h) -- same names, values normalized from
     // raylib's 0-255 uint8_t channels to DirectX::XMFLOAT4's 0.0-1.0 floats (channel / 255.0f).
@@ -34,5 +35,31 @@ namespace JLib {
         const DirectX::XMFLOAT4 Black    = { 0.0f,    0.0f,    0.0f,    1.0f };
         const DirectX::XMFLOAT4 Blank    = { 0.0f,    0.0f,    0.0f,    0.0f };
         const DirectX::XMFLOAT4 Magenta  = { 1.0f,    0.0f,    1.0f,    1.0f };
+
+		// inline -- these are defined in a header included by many .cpp files across the project.
+		// Without inline, each translation unit emits its own external-linkage copy of the same
+		// symbol, and the linker fails with "already defined"/"multiply defined symbols" the
+		// moment more than one of them gets linked together (same pattern as GetTime.h's inline
+		// statics -- a header-only definition needs inline or a single .cpp home, one or the other).
+		inline DirectX::XMFLOAT4 GetRandomColor() {
+			float r = static_cast<float>(rand()) / RAND_MAX;
+			float g = static_cast<float>(rand()) / RAND_MAX;
+			float b = static_cast<float>(rand()) / RAND_MAX;
+			return { r, g, b, 1.0f };
+		}
+		inline DirectX::XMFLOAT4 ColorLerp(const DirectX::XMFLOAT4& a, const DirectX::XMFLOAT4& b, float t) {
+			return {
+				a.x + (b.x - a.x) * t,
+				a.y + (b.y - a.y) * t,
+				a.z + (b.z - a.z) * t,
+				a.w + (b.w - a.w) * t
+			};
+		}
+		inline DirectX::XMFLOAT4 ColorFromHex(uint32_t hex) {
+			float r = ((hex >> 16) & 0xFF) / 255.0f;
+			float g = ((hex >> 8) & 0xFF) / 255.0f;
+			float b = (hex & 0xFF) / 255.0f;
+			return { r, g, b, 1.0f };
+		}
     }
 }
