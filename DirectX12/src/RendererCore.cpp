@@ -133,6 +133,20 @@ void RendererCore::PresentFrame() {
 	// POST list: transition the back buffer back to PRESENT (single-threaded, executed last).
 	m_PostAllocators[frame]->Reset();
 	m_PostList->Reset(m_PostAllocators[frame].Get(), nullptr);
+	// ImGui draws here, at the top of POST -- the back buffer is still RENDER_TARGET (the
+	// barrier below hasn't run yet) and every 2D layer has already been submitted before this
+	// list, so the UI lands on top of everything. RenderDrawData needs the RTV bound and the
+	// ImGui SRV heap set itself; nothing else in POST cares, so no state leaks to un-set.
+	// Gated on GetDrawData(): non-null only after the app called ImGui::NewFrame + ImGui::Render
+	// this frame, so a consumer that never calls InitImGui skips all of this for free.
+	if (ImGui::GetCurrentContext() && ImGui::GetDrawData()) {
+		CD3DX12_CPU_DESCRIPTOR_HANDLE imguiRtv(
+			m_RTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), backBuffer, m_RTVDescriptorSize);
+		m_PostList->OMSetRenderTargets(1, &imguiRtv, FALSE, nullptr);
+		ID3D12DescriptorHeap* imguiHeaps[] = { m_imguiDescriptorHeap.Get() };
+		m_PostList->SetDescriptorHeaps(1, imguiHeaps);
+		ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_PostList.Get());
+	}
 	auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
 		m_BackBuffers[backBuffer].Get(),
 		D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1224,4 +1238,94 @@ void RendererCore::FlushSpawns(ParticleEffectPool& pool) {
 	memcpy(mapped, pool.pendingSpawns.data(), pool.pendingSpawns.size() * sizeof(Particle2D));
 	pool.spawnBuffer->Unmap(0, nullptr);
 	pool.pendingSpawns.clear();
+}
+// Slot allocator over the ImGui SRV heap -- the backend requests a descriptor through the
+// Alloc callback whenever it creates a texture (font atlas, future ImGui::Image() textures)
+// and returns it through Free when the texture dies. File-scope static because the InitInfo
+// callbacks are plain function pointers (no captures allowed), so they can't reach instance
+// members; fine since ImGui only ever has one context/backend alive at a time.
+static struct ImGuiSrvHeapAlloc {
+	D3D12_CPU_DESCRIPTOR_HANDLE cpuStart{};
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuStart{};
+	UINT increment = 0;
+	std::vector<int> freeSlots;
+} s_imguiHeapAlloc;
+
+void RendererCore::InitImGui(HWND hwnd)
+{
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+
+	ImGuiIO& io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	// Do NOT set ImGuiBackendFlags_RendererHasTextures by hand -- the struct-based
+	// ImGui_ImplDX12_Init below sets it itself, and setting it here does nothing anyway.
+	// The LEGACY 6-arg Init overload must never be used with this ImGui version (1.92.9 WIP):
+	// it CLEARS RendererHasTextures internally (imgui_impl_dx12.cpp, io.BackendFlags &= ~...),
+	// and this backend has no font-upload path outside the textures protocol anymore -- so the
+	// font atlas never reaches the GPU and the first NewFrame/text measurement crashes on null
+	// font/texture data. That single line is what every "crashes in the font atlas" failure in
+	// this integration traced back to.
+	io.Fonts->AddFontDefault();
+
+	ImGui::StyleColorsDark();
+
+	ImGui_ImplWin32_Init(hwnd);
+
+	// Descriptor heap -- multiple slots, NOT 1: with the textures protocol the backend
+	// allocates an SRV per texture through the callbacks below (font atlas now, any
+	// ImGui::Image() textures later).
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	desc.NumDescriptors = 64;
+	desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+	if (FAILED(m_Device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&m_imguiDescriptorHeap)))) {
+		OutputDebugStringA("Failed to create ImGui descriptor heap!\n");
+		return;
+	}
+
+	s_imguiHeapAlloc.cpuStart = m_imguiDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+	s_imguiHeapAlloc.gpuStart = m_imguiDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+	s_imguiHeapAlloc.increment = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	s_imguiHeapAlloc.freeSlots.clear();
+	for (int i = (int)desc.NumDescriptors - 1; i >= 0; --i)
+		s_imguiHeapAlloc.freeSlots.push_back(i);
+
+	// DX12 Init -- struct-based path, the only one that works on this ImGui version.
+	ImGui_ImplDX12_InitInfo info{};
+	info.Device = m_Device.Get();
+	info.CommandQueue = m_CommandQueue.Get(); // real graphics queue -- texture uploads sync against it
+	info.NumFramesInFlight = NumFrames;       // 3, matching the swapchain
+	info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+	info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+	info.SrvDescriptorHeap = m_imguiDescriptorHeap.Get();
+	info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo*,
+		D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+		D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
+			IM_ASSERT(!s_imguiHeapAlloc.freeSlots.empty() && "ImGui SRV heap exhausted");
+			int slot = s_imguiHeapAlloc.freeSlots.back();
+			s_imguiHeapAlloc.freeSlots.pop_back();
+			outCpu->ptr = s_imguiHeapAlloc.cpuStart.ptr + (SIZE_T)slot * s_imguiHeapAlloc.increment;
+			outGpu->ptr = s_imguiHeapAlloc.gpuStart.ptr + (UINT64)slot * s_imguiHeapAlloc.increment;
+		};
+	info.SrvDescriptorFreeFn = [](ImGui_ImplDX12_InitInfo*,
+		D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+		D3D12_GPU_DESCRIPTOR_HANDLE) {
+			int slot = (int)((cpu.ptr - s_imguiHeapAlloc.cpuStart.ptr) / s_imguiHeapAlloc.increment);
+			s_imguiHeapAlloc.freeSlots.push_back(slot);
+		};
+	if (!ImGui_ImplDX12_Init(&info)) {
+		OutputDebugStringA("ImGui_ImplDX12_Init failed!\n");
+		return;
+	}
+
+	// PSO etc. -- fonts are NOT built here on this ImGui version; the backend creates and
+	// uploads the font texture during ImGui_ImplDX12_RenderDrawData (textures protocol).
+	if (!ImGui_ImplDX12_CreateDeviceObjects()) {
+		OutputDebugStringA("ImGui_ImplDX12_CreateDeviceObjects FAILED!\n");
+	}
+	else {
+		OutputDebugStringA("ImGui initialized successfully!\n");
+	}
 }

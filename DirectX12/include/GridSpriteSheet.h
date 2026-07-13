@@ -1,6 +1,6 @@
 #pragma once
 #include <DirectXMath.h>
-#include <ResourceManager.h>
+#include "ResourceManager.h"
 
 // Static sibling of GridSpriteAnimation -- for pre-made TILESETS (world_tileset.png: bricks,
 // ground, water, decorations, all distinct art, nothing meant to cycle) rather than character

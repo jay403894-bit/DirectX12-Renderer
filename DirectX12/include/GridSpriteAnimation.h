@@ -1,6 +1,6 @@
 #pragma once
 #include <DirectXMath.h>
-#include <ResourceManager.h>
+#include "ResourceManager.h"
 
 // For pre-made sprite sheets (Brackeys-style free asset packs, etc.) that already ARE one image
 // sliced into a uniform grid -- unlike AtlasAnimation (named-region lookup via AtlasPacker's

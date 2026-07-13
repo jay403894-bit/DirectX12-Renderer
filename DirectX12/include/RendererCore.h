@@ -12,6 +12,9 @@
 #include <functional>
 #include <GetTime.h> // JLib::Time -- QueryPerformanceCounter-backed clock, shared with GetFrameTime()
 #include "ResourceManager.h" // TextureHandle -- carried by value, needs the full definition
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_win32.h"
+#include "imgui/imgui_impl_dx12.h"
 namespace JLib {
     // One particle, shared GPU-buffer layout across every .hlsl behavior/spawn shader and every
     // particle pool. MUST stay in sync with the Particle struct in UpdateParticles.hlsl,
@@ -125,6 +128,7 @@ namespace JLib {
         void SetVSync(bool v) { m_VSync = v; }
         bool VSync() const { return m_VSync; }
         bool IsInitialized() const { return m_IsInitialized; }
+        void InitImGui(HWND hwnd);
 
         void ExecuteUploadCommand(std::function<void(ID3D12GraphicsCommandList*)> task);
         // cameraPos/cameraZoom default to {0,0}/1.0f (camera centered at world origin, no zoom) --
@@ -145,6 +149,8 @@ namespace JLib {
         ID3D12Device2* GetDevice() const { return m_Device.Get(); }
         ID3D12CommandQueue* GetCommandQueue() const { return m_CommandQueue.Get(); }
         ID3D12DescriptorHeap* GetRTVDescriptorHeap() const { return m_RTVDescriptorHeap.Get(); }
+        ID3D12DescriptorHeap* GetImGUIDescriptorHeap() const { return m_imguiDescriptorHeap.Get(); }
+
         UINT GetRTVDescriptorSize() const { return m_RTVDescriptorSize; }
         ID3D12Resource* GetConstantBuffer(int frame) const { return m_ConstantBuffers[frame].Get(); }
         uint32_t GetClientWidth() const { return m_ClientWidth; }
@@ -396,6 +402,8 @@ namespace JLib {
         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_PostList;
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator>    m_PostAllocators[NumFrames];
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>      m_RTVDescriptorHeap;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>      m_imguiDescriptorHeap = nullptr;
+
         UINT m_RTVDescriptorSize = 0;
         // m_CurrentBackBufferIndex: WHICH SWAP-CHAIN BACK BUFFER to render into this frame --
         // DXGI-controlled (via GetCurrentBackBufferIndex()). ONLY use this for things tied to the
