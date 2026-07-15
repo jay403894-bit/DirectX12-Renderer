@@ -1,6 +1,13 @@
 #include "../include/Window.h"
 #include "../include/RendererCore.h"   // full definition needed here to call m_renderer->Resize()
+#include "../include/imgui/imgui.h"    // IMGUI_IMPL_API + ImGui::GetCurrentContext
 using namespace JLib;
+
+// imgui_impl_win32.h deliberately hides this declaration inside an `#if 0` block (to avoid
+// pulling <windows.h> into that helper header) and instructs you to forward-declare it in
+// your own .cpp -- so `#include`ing the backend header does NOT bring it in. Window.h
+// already includes <windows.h>, so the Win32 types below are available here.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 Window::Window(HINSTANCE hInstance, const wchar_t* title, int width, int height, bool resizable)
     : m_hInstance(hInstance) {
@@ -67,6 +74,18 @@ LRESULT CALLBACK Window::WndProcSetup(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 }
 
 LRESULT CALLBACK Window::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Feed every message to ImGui's Win32 backend FIRST -- this is the only path by which
+    // ImGui learns mouse position, clicks, and keys. Without it, ImGui windows can't be
+    // dragged and no widget (button, radio, drag) responds. The context check guards the
+    // window messages that arrive before InitImGui creates the context (the window is
+    // created before RendererCore::InitImGui runs). Returning true when ImGui consumes a
+    // message keeps it from also driving game input, but note the game's own input path is
+    // GameInput (InputManager), not WndProc, so this only gates the WndProc-based handling
+    // (resize/vsync/fullscreen/quit) below -- which is the desired behavior when a UI is up.
+    if (ImGui::GetCurrentContext() != nullptr &&
+        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+
     auto* pWindow = reinterpret_cast<Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
 
     switch (msg) {
@@ -86,9 +105,11 @@ LRESULT CALLBACK Window::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (pWindow && pWindow->m_renderer)
                 pWindow->m_renderer->SetVSync(!pWindow->m_renderer->VSync());
             break;
-        case VK_ESCAPE:
-            PostQuitMessage(0);
-            break;
+        // NOTE: VK_ESCAPE is deliberately NOT handled here. It used to PostQuitMessage(0),
+        // which killed the whole app before any scene could see the key -- so a scene's
+        // Escape->PopScene (return to menu) was pre-empted by a hard exit, and Escape quit
+        // even from the start menu. Escape is now owned by the scene stack (see each Scene's
+        // HandleInput); only the start menu's own QUIT command actually ends the program.
         case VK_F11:
             if (pWindow) pWindow->SetFullscreen(!pWindow->m_fullscreen);
             break;

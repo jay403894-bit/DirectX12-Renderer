@@ -71,7 +71,12 @@ TextureHandle ResourceManager::LoadTexture(const std::wstring& filename, ID3D12G
     texDesc.Height = (UINT)meta.height;
     texDesc.DepthOrArraySize = 1;
     texDesc.MipLevels = 1;
-    texDesc.Format = meta.format;
+    // Force linear (non-sRGB) for sprites -- pixel values render directly without gamma
+    // interpretation, otherwise sRGB textures appear darker during sampling.
+    DXGI_FORMAT fmt = meta.format;
+    if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.Format = fmt;
     texDesc.SampleDesc.Count = 1;
     texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 

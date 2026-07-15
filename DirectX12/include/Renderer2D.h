@@ -259,6 +259,21 @@ namespace JLib {
         // Call AFTER Initialize() (needs m_Core's device + m_RootSignature). Shares the existing
         // root signature -- only add an override param for a new one if an effect needs different
         // bound resources (most effects just need a different VS/PS/blend, not a new root sig).
+        inline ImTextureID GetImGuiTextureID(TextureHandle tex) const
+        {
+            // If it's an integer type, return 0 for an invalid handle
+            if (!tex.IsValid()) return 0;
+
+            D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = m_SrvHeap->GetGPUDescriptorHandleForHeapStart();
+
+            ID3D12Device* device = m_Core->GetDevice();
+            UINT descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+            gpuHandle.ptr += (SIZE_T)tex.id * descriptorSize;
+
+            // Direct value cast from uint64_t to whatever integer ImTextureID is
+            return static_cast<ImTextureID>(gpuHandle.ptr);
+        }
         uint32_t RegisterEffect(const std::wstring& vsPath, const std::wstring& psPath, D3D12_BLEND_DESC blend);
         static void FlushBatchTask(void* data) {
             FlushTaskContext* ctx = static_cast<FlushTaskContext*>(data);

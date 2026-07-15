@@ -46,6 +46,7 @@ struct VS_OUTPUT
     float2 uv : TEXCOORD;
     float useTexture : TEXCOORD1;
     float useAlphaFromRGB : TEXCOORD2;
+    float4 effectParams : TEXCOORD3; // MUST be here or 
 };
 
 // Add SV_InstanceID to the function parameters
@@ -80,5 +81,6 @@ VS_OUTPUT VSMain(VS_INPUT input, uint instanceID : SV_InstanceID)
     output.uv = input.uv * obj.uvScale + obj.uvOffset;
     output.useTexture = obj.useTexture;
     output.useAlphaFromRGB = obj.useAlphaFromRGB;
+    output.effectParams = obj.effectParams;
     return output;
 }

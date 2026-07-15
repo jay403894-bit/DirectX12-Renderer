@@ -7,6 +7,7 @@ struct PS_INPUT
     float2 uv : TEXCOORD; // Add this
     float useTexture : TEXCOORD1; // Add this
     float useAlphaFromRGB : TEXCOORD2;
+    float4 effectParams : TEXCOORD3; // unused here -- just matches the shared VS output signature
 };
 
 // Add these at the top of your shader file
